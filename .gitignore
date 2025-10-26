@@ -2,6 +2,15 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# API TOKEN
+config.py
+
+# HTML Response
+ssstik_response.html
 
 # C extensions
 *.so
