@@ -1,5 +1,6 @@
 import logging
 import os
+import subprocess
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from urllib.parse import urlparse
@@ -109,9 +110,21 @@ def main():
     application.run_polling(poll_interval=3)
 
 if __name__ == '__main__':
+    FFMPEG_BIN_PATH = r"C:\Program Files\FFmpeg\ffmpeg-win64\bin"
+    ffmpeg_exe_path = os.path.join(FFMPEG_BIN_PATH, 'ffmpeg.exe')
+    if os.path.exists(ffmpeg_exe_path):
+        os.environ['PATH'] += os.pathsep + FFMPEG_BIN_PATH
+        logger.info("FFmpeg Path berhasil ditambahkan secara runtime.")
     try:
-        os.system('ffmpeg -version >/dev/null 2>&1')
-        logger.info("FFmpeg berhasil terdeteksi di sistem.")
+        result = subprocess.run(
+            ['ffmpeg', '-version'],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            logger.info("FFmpeg berhasil terdeteksi di sistem.")
+        else:
+            logger.warning("Peringatan: FFmpeg mungkin tidak terdeteksi atau gagal dijalankan")
     except Exception:
         logger.warning("Peringatan: FFmpeg mungkin tidak terdeteksi. Penggabungan video/audio mungkin gagal. Pastikan FFmpeg terinstal dan ada di PATH.")
     main()
