@@ -59,7 +59,7 @@ def get_tiktok_file_path(tiktok_url: str) -> Optional[str]:
                 video_download_url = std_match.group(1)
                 logger.info("Tautan Tiktok standar ditemukan.")
             else:
-                logger.warning("RegExx gagal menemukan tautan unduhan HD atau standar.")
+                logger.warning("RegEx gagal menemukan tautan unduhan HD atau standar.")
         if video_download_url:
             if not video_download_url.startswith('http'):
                 video_download_url = f"https:{video_download_url}"
