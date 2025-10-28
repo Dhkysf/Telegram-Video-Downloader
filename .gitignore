@@ -6,8 +6,9 @@ __pycache__/
 *.pyo
 *.pyd
 
-# API TOKEN
+# Config and Private
 config.py
+instagram_cookies.txt
 
 # Video Folder
 temp_downloads/
