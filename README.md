@@ -2,6 +2,8 @@
 
 A personal Telegram bot for downloading videos on a Windows PC using `python-telegram-bot` (long polling) and `yt-dlp`. Send a link, inspect the preview, and confirm to receive the video (or audio) back in chat.
 
+> **Note:** This bot is for personal use only; please respect copyright and the rules of each platform.
+
 ## 1. What it is
 
 - **Multi-site support via `yt-dlp`**: TikTok (with an `ssstik.io` scraper fallback), Instagram, X/Twitter, YouTube, SoundCloud, and other public HTTP/HTTPS links.
