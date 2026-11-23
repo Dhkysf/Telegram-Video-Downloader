@@ -705,6 +705,7 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
 
             res = await tgbot.flows.probe_link("https://example.com/watch", "generic", state, None, force_browser=True)
             self.assertEqual(res.error, ErrorCode.UNSUPPORTED)
+
             br_mock.assert_not_called()
 
             for bad_data in (f"dl:{tok}:-1", f"au:{tok}:-1", f"dl:{tok}:99"):
@@ -753,6 +754,245 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_network_guard_active())
         self.assertEqual(calls, 1)
         self.assertEqual(res.error, ErrorCode.UNSUPPORTED)
+
+    async def test_pending_cap_and_last_request_pruning(self) -> None:
+        state = make_state(user_cooldown_seconds=10.0)
+        now = time.monotonic()
+        state.last_request[1] = now - 20.0
+        state.last_request[2] = now - 2.0
+        state.pending["old"] = tgbot.state.PendingChoice(
+            1, make_message("https://youtube.com/watch?v=old"), "https://youtube.com/watch?v=old",
+            "youtube", "YouTube", ProbeResult(ErrorCode.OK), now - tgbot.state.PENDING_TTL_SECONDS - 1,
+        )
+        tgbot.state.purge_expired(state)
+        self.assertNotIn("old", state.pending)
+        self.assertNotIn(1, state.last_request)
+        self.assertIn(2, state.last_request)
+
+        probe = ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://youtube.com/watch?v=1", title="V")])
+        with patch.object(tgbot.preview, "PENDING_MAX_ENTRIES", 3):
+            for i in range(4):
+                p = tgbot.state.PendingChoice(100 + i, make_message(f"https://youtube.com/watch?v={i}"), f"https://youtube.com/watch?v={i}", "youtube", "YouTube", probe, time.monotonic())
+                await tgbot.preview.send_preview(p, state)
+        self.assertEqual(len(state.pending), 3)
+        self.assertEqual([p.user_id for p in state.pending.values()], [101, 102, 103])
+
+    def test_guardproxy_local_block_tunnel_cap_and_exit_cleanup(self) -> None:
+        import socket
+        from urllib.parse import urlsplit
+        from downloaders.common import install_network_guard
+        from downloaders.guardproxy import GuardProxy
+
+        install_network_guard()
+        with GuardProxy(max_tunnels=1) as proxy:
+            host, port = urlsplit(proxy.url).hostname, urlsplit(proxy.url).port
+            assert host and port
+            with socket.create_connection((host, port), timeout=3.0) as s:
+                s.sendall(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n")
+                resp = s.recv(1024)
+            self.assertIn(b"403 Forbidden", resp)
+            self.assertEqual(proxy.blocked, 1)
+
+            held = socket.create_connection((host, port), timeout=3.0)
+            held.sendall(b"GET http://example.com/")  # Incomplete head holds the 1 tunnel slot.
+            time.sleep(0.05)
+            with socket.create_connection((host, port), timeout=3.0) as s2:
+                resp2 = s2.recv(1024)
+            self.assertIn(b"503 Service Unavailable", resp2)
+        held.close()
+        self.assertEqual(proxy._active_sockets, set())
+
+    def test_streaminfo_hls_cancel_cache_and_parsers(self) -> None:
+        import threading
+        from downloaders.browser import BrowserCapture, CapturedStream
+        from downloaders import streaminfo
+
+        master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=720x1280\nvariant.m3u8\n"
+        variant = "#EXTM3U\n#EXTINF:5.0,\nseg1.ts\n#EXTINF:7.0,\nseg2.ts\n#EXT-X-ENDLIST\n"
+        drm_hls = '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="https://e.com/k"\n#EXTINF:5.0,\nseg.ts\n#EXT-X-ENDLIST\n'
+        live_hls = "#EXTM3U\n#EXTINF:5.0,\nseg1.ts\n"
+        dash_ok = '<MPD mediaPresentationDuration="PT1M30.5S"><Representation height="1080"/></MPD>'
+        dash_live = '<MPD type="dynamic" mediaPresentationDuration="PT10S"><Representation height="720"/></MPD>'
+        dash_drm = '<MPD mediaPresentationDuration="PT10S"><ContentProtection/></MPD>'
+
+        cancel = threading.Event()
+        cancel.set()
+        cap_cancel = BrowserCapture(
+            error=ErrorCode.OK,
+            final_url="https://example.com", title="T", user_agent="UA",
+            streams=[CapturedStream(url="https://cdn.example.com/master.m3u8", content_type="application/vnd.apple.mpegurl")],
+        )
+        with patch.object(streaminfo, "_get_text", side_effect=AssertionError("must not fetch when cancelled")):
+            res_cancel = streaminfo.analyze_capture(cap_cancel, cancel_event=cancel)
+        self.assertEqual(res_cancel.error, ErrorCode.NOT_FOUND)
+
+        fetches: list[str] = []
+        texts = {
+            "https://cdn.example.com/master.m3u8": master,
+            "https://cdn.example.com/variant.m3u8": variant,
+            "https://cdn.example.com/drm.m3u8": drm_hls,
+            "https://cdn.example.com/live.m3u8": live_hls,
+            "https://cdn.example.com/ad.mpd": dash_ok,
+            "https://cdn.example.com/live.mpd": dash_live,
+            "https://cdn.example.com/drm.mpd": dash_drm,
+        }
+
+        def fake_get_text(_sess: object, url: str) -> str | None:
+            fetches.append(url)
+            return texts.get(url)
+
+        cap = BrowserCapture(
+            error=ErrorCode.OK,
+            final_url="https://example.com", title="Page", user_agent="UA",
+            streams=[
+                CapturedStream(url="https://cdn.example.com/master.m3u8", content_type="application/vnd.apple.mpegurl"),
+                CapturedStream(url="https://cdn.example.com/variant.m3u8", content_type="application/vnd.apple.mpegurl"),
+                CapturedStream(url="https://cdn.example.com/drm.m3u8", content_type="application/vnd.apple.mpegurl"),
+                CapturedStream(url="https://cdn.example.com/live.m3u8", content_type="application/vnd.apple.mpegurl"),
+                CapturedStream(url="https://doubleclick.net/ad.mpd", content_type="application/dash+xml"),
+                CapturedStream(url="https://cdn.example.com/live.mpd", content_type="application/dash+xml"),
+                CapturedStream(url="https://cdn.example.com/drm.mpd", content_type="application/dash+xml"),
+            ],
+        )
+        with patch.object(streaminfo, "_get_text", side_effect=fake_get_text):
+            res = streaminfo.analyze_capture(cap)
+        self.assertEqual(res.error, ErrorCode.OK)
+        self.assertEqual(fetches.count("https://cdn.example.com/master.m3u8"), 1)
+        self.assertEqual(fetches.count("https://cdn.example.com/variant.m3u8"), 1)
+        self.assertEqual(len(res.candidates), 1)  # Only master.m3u8 (variant deduped, drm/live dropped, ad.mpd not in texts).
+        self.assertEqual(res.candidates[0].height, 720)
+        self.assertAlmostEqual(res.candidates[0].duration or 0.0, 12.0)
+
+        with patch.object(streaminfo, "_get_text", side_effect=fake_get_text):
+            cap_dash = BrowserCapture(
+                error=ErrorCode.OK,
+                final_url="https://example.com", title="D", user_agent="UA",
+                streams=[CapturedStream(url="https://cdn.example.com/ad.mpd", content_type="application/dash+xml")],
+            )
+            res_dash = streaminfo.analyze_capture(cap_dash)
+        self.assertEqual(res_dash.candidates[0].height, 1080)
+        self.assertAlmostEqual(res_dash.candidates[0].duration or 0.0, 90.5)
+
+        mvhd = (12).to_bytes(4, "big") + b"mvhd" + bytes(12) + (1000).to_bytes(4, "big") + (5000).to_bytes(4, "big") + bytes(12)
+        tkhd = (20).to_bytes(4, "big") + b"tkhd" + bytes(4) + (1280 << 16).to_bytes(4, "big") + (720 << 16).to_bytes(4, "big")
+        dur, h, has_hdr = streaminfo._parse_mp4(mvhd + tkhd)
+        self.assertTrue(has_hdr)
+        self.assertAlmostEqual(dur or 0.0, 5.0)
+        self.assertEqual(h, 720)
+
+    async def test_preview_errors_and_check_link_failure(self) -> None:
+        from telegram.error import BadRequest
+        state = make_state(user_cooldown_seconds=0.0)
+        ctx = make_context(state)
+        probe = ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://youtube.com/watch?v=1", title="V")])
+
+        class BadEditMsg(FakeSentMessage):
+            def __init__(self, exc: Exception) -> None:
+                super().__init__(text="preview")
+                self._exc = exc
+
+            async def edit_text(self, text: str, **kwargs: object) -> FakeSentMessage:
+                raise self._exc
+
+        p_forb = tgbot.state.PendingChoice(100, make_message("https://youtube.com/watch?v=1"), "https://youtube.com/watch?v=1", "youtube", "YouTube", probe, time.monotonic(), preview=BadEditMsg(Forbidden("blocked")), preview_html="p\n\nq")  # type: ignore[arg-type]
+        self.assertFalse(await tgbot.preview.finish_preview(p_forb, "note"))
+
+        p_net = tgbot.state.PendingChoice(100, make_message("https://youtube.com/watch?v=1"), "https://youtube.com/watch?v=1", "youtube", "YouTube", probe, time.monotonic(), preview=BadEditMsg(NetworkError("net")), preview_html="p\n\nq")  # type: ignore[arg-type]
+        with patch.object(tgbot.telegram_io, "backoff_delay", return_value=0.0):
+            self.assertTrue(await tgbot.preview.finish_preview(p_net, "note"))
+
+        class BadQuery(FakeQuery):
+            def __init__(self, data: str, exc: Exception) -> None:
+                super().__init__(data)
+                self._exc = exc
+
+            async def edit_message_reply_markup(self, reply_markup: object = None) -> None:
+                raise self._exc
+
+        for exc in (Forbidden("blocked"), NetworkError("net")):
+            q_exp = BadQuery("dl:missing:0", exc)
+            with patch.object(tgbot.telegram_io, "backoff_delay", return_value=0.0):
+                await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_exp, effective_user=User(100, "u", False)), ctx)
+            self.assertEqual(q_exp.answers, [(tgbot.texts.EXPIRED_TEXT, True)])
+
+        with (
+            patch.object(tgbot.flows, "probe_ytdlp", return_value=probe),
+            patch.object(tgbot.flows, "send_preview", side_effect=BadRequest("bad html")),
+        ):
+            await tgbot.flows.check_link(ctx, make_message("https://youtube.com/watch?v=err1"), 100, "https://youtube.com/watch?v=err1", "youtube", state)
+        self.assertFalse(self.sent[-1].deleted)
+        self.assertEqual(self.sent[-1].text, tgbot.texts.ERROR_MESSAGES[ErrorCode.NETWORK])
+
+        with (
+            patch.object(tgbot.flows, "send_preview", side_effect=NetworkError("net")),
+            patch.object(tgbot.telegram_io, "backoff_delay", return_value=0.0),
+        ):
+            await tgbot.flows.check_link(ctx, make_message("https://youtube.com/watch?v=err1"), 100, "https://youtube.com/watch?v=err1", "youtube", state)
+        self.assertEqual(self.sent[-1].text, tgbot.texts.ERROR_MESSAGES[ErrorCode.NETWORK])
+
+    def test_common_network_guard_socket(self) -> None:
+        import socket
+        from downloaders.common import BlockedAddressError, install_network_guard, public_network_only
+
+        install_network_guard()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0) as ok_conn:
+                self.assertTrue(ok_conn.fileno() >= 0)
+            with public_network_only():
+                with self.assertRaises(BlockedAddressError):
+                    socket.create_connection(("127.0.0.1", port), timeout=1.0)
+
+    def test_ytdlp_classify_error_and_format_selector(self) -> None:
+        from downloaders.ytdlp import build_format_selector, classify_error
+
+        cases = [
+            ("connection to a non-public address was blocked", ErrorCode.UNSUPPORTED),
+            ("This video is DRM protected", ErrorCode.UNSUPPORTED),
+            ("HTTP Error 429: Too Many Requests", ErrorCode.RATE_LIMITED),
+            ("Sign in to confirm you're not a bot", ErrorCode.PRIVATE_OR_LOGIN),
+            ("Unsupported URL: https://x.com", ErrorCode.UNSUPPORTED),
+            ("ffmpeg not found", ErrorCode.UNKNOWN),
+            ("HTTP Error 404: Not Found", ErrorCode.NOT_FOUND),
+            ("HTTP Error 502: Bad Gateway", ErrorCode.NETWORK),
+            ("something completely unexpected", ErrorCode.UNKNOWN),
+        ]
+        for msg, expected in cases:
+            self.assertEqual(classify_error(msg), expected, msg)
+        for can_merge in (True, False):
+            for last_resort in (True, False):
+                sel = build_format_selector(can_merge, last_resort)
+                self.assertTrue(sel)
+                self.assertEqual("+" in sel, can_merge)
+
+    def test_settings_redaction_and_allowed_users(self) -> None:
+        import logging
+        secret = "123456:SECRET_TOKEN_XYZ"
+        fmt = tgbot.settings.RedactingFormatter("%(levelname)s %(message)s", secret)
+        rec = logging.LogRecord("test", logging.ERROR, __file__, 1, "Failed for %s", (secret,), None)
+        out = fmt.format(rec)
+        self.assertNotIn(secret, out)
+        self.assertIn("[REDACTED_TOKEN]", out)
+
+        self.assertIsNone(tgbot.settings._parse_allowed_users(""))
+        self.assertEqual(tgbot.settings._parse_allowed_users("10, 20"), frozenset({10, 20}))
+        self.assertEqual(tgbot.settings._parse_allowed_users("10, bad, 20"), frozenset({10, 20}))
+        self.assertEqual(tgbot.settings._parse_allowed_users("bad"), frozenset())
+
+    async def test_auto_pick_and_confirm_off(self) -> None:
+        good = MediaCandidate(url="https://e.com/1.mp4", duration=60)
+        ad = MediaCandidate(url="https://e.com/ad.mp4", duration=10, likely_ad=True)
+        self.assertEqual(tgbot.preview.auto_pick(ProbeResult(ErrorCode.OK, [good, ad])), good)
+        self.assertIsNone(tgbot.preview.auto_pick(ProbeResult(ErrorCode.OK, [ad])))
+
+        state = make_state(confirm_before_download=False)
+        ctx = make_context(state)
+        with patch.object(tgbot.flows, "probe_ytdlp", return_value=ProbeResult(ErrorCode.OK, [ad])):
+            await tgbot.handlers.handle_text(Update(1, message=make_message("https://youtube.com/watch?v=ad")), ctx)
+        self.assertEqual(self.sent[-1].text, tgbot.texts.ONLY_ADS_TEXT)
+        self.assertEqual(state.pending, {})
 
     def test_instance_lock_and_main_exit_codes(self) -> None:
         import os
