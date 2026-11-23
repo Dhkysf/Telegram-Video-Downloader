@@ -182,8 +182,18 @@ def _parse_mp4(data: bytes) -> tuple[Optional[float], Optional[int], bool]:
     return duration, height, b"mvhd" in data
 
 
-def _inspect_hls(session: requests.Session, url: str, deadline: _Deadline) -> _StreamInfo:
-    text = _get_text(session, url)
+def _inspect_hls(
+    session: requests.Session,
+    url: str,
+    deadline: _Deadline,
+    text_cache: Optional[dict[str, Optional[str]]] = None,
+) -> _StreamInfo:
+    if text_cache is not None and url in text_cache:
+        text = text_cache[url]
+    else:
+        text = _get_text(session, url)
+        if text_cache is not None:
+            text_cache[url] = text
     if not text or "#EXTM3U" not in text:
         return _StreamInfo(kind="HLS", usable=False)
     info = _StreamInfo(kind="HLS", drm=bool(HLS_DRM_PATTERN.search(text)))
@@ -206,7 +216,16 @@ def _inspect_hls(session: requests.Session, url: str, deadline: _Deadline) -> _S
             return int(match.group(1)) if match else 0
 
         _attrs, variant_url = max(variants, key=bandwidth)
-        media_text = "" if deadline.expired() else (_get_text(session, urljoin(url, variant_url.strip())) or "")
+        variant_full = urljoin(url, variant_url.strip())
+        if text_cache is not None and variant_full in text_cache:
+            media_text = text_cache[variant_full] or ""
+        elif deadline.expired():
+            media_text = ""
+        else:
+            fetched = _get_text(session, variant_full)
+            if text_cache is not None:
+                text_cache[variant_full] = fetched
+            media_text = fetched or ""
         info.drm = info.drm or bool(HLS_DRM_PATTERN.search(media_text))
     durations = [float(value) for value in HLS_EXTINF.findall(media_text)]
     if durations:
@@ -247,12 +266,17 @@ def _inspect_file(session: requests.Session, stream: CapturedStream, deadline: _
     return info
 
 
-def _inspect(session: requests.Session, stream: CapturedStream, deadline: _Deadline) -> _StreamInfo:
+def _inspect(
+    session: requests.Session,
+    stream: CapturedStream,
+    deadline: _Deadline,
+    text_cache: Optional[dict[str, Optional[str]]] = None,
+) -> _StreamInfo:
     """Inspect one captured stream according to its type."""
     path = urlparse(stream.url).path.lower()
     content_type = stream.content_type.lower()
     if path.endswith(".m3u8") or content_type.startswith(HLS_CONTENT_TYPES):
-        info = _inspect_hls(session, stream.url, deadline)
+        info = _inspect_hls(session, stream.url, deadline, text_cache)
     elif path.endswith(".mpd") or content_type.startswith(DASH_CONTENT_TYPE):
         info = _inspect_dash(session, stream.url)
     else:
@@ -262,7 +286,12 @@ def _inspect(session: requests.Session, stream: CapturedStream, deadline: _Deadl
     return info
 
 
-def _hls_variant_keys(session: requests.Session, streams: list[CapturedStream]) -> set[str]:
+def _hls_variant_keys(
+    session: requests.Session,
+    streams: list[CapturedStream],
+    deadline: _Deadline,
+    text_cache: dict[str, Optional[str]],
+) -> set[str]:
     """Return host+path keys of media playlists referenced by captured master playlists.
 
     A player loads the master playlist and then one of its variants; both
@@ -270,11 +299,15 @@ def _hls_variant_keys(session: requests.Session, streams: list[CapturedStream]) 
     """
     keys: set[str] = set()
     for stream in streams:
+        if deadline.expired():
+            break
         if not urlparse(stream.url).path.lower().endswith(".m3u8") and not stream.content_type.lower().startswith(
             HLS_CONTENT_TYPES
         ):
             continue
-        text = _get_text(session, stream.url) or ""
+        if stream.url not in text_cache:
+            text_cache[stream.url] = _get_text(session, stream.url)
+        text = text_cache[stream.url] or ""
         for _attrs, variant in HLS_STREAM_INF.findall(text):
             parsed = urlparse(urljoin(stream.url, variant.strip()))
             keys.add(f"{parsed.netloc}{parsed.path}")
@@ -320,7 +353,8 @@ def _analyze(
     session: requests.Session, capture: BrowserCapture, deadline: _Deadline
 ) -> tuple[list[MediaCandidate], dict[str, int]]:
     """Inspect streams, drop unusable ones, flag ads and rank the rest."""
-    variant_keys = _hls_variant_keys(session, capture.streams)
+    hls_cache: dict[str, Optional[str]] = {}
+    variant_keys = _hls_variant_keys(session, capture.streams, deadline, hls_cache)
     skipped: dict[str, int] = {}
     found: list[tuple[CapturedStream, _StreamInfo]] = []
     for stream in capture.streams:
@@ -329,7 +363,7 @@ def _analyze(
         parsed = urlparse(stream.url)
         if f"{parsed.netloc}{parsed.path}" in variant_keys:
             continue  # Variant of a master playlist that is already listed.
-        info = _inspect(session, stream, deadline)
+        info = _inspect(session, stream, deadline, hls_cache)
         reason = "drm" if info.drm else "live" if info.live else "" if info.usable else "unusable"
         if reason:
             skipped[reason] = skipped.get(reason, 0) + 1

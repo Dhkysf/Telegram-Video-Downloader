@@ -18,6 +18,7 @@ from tgbot.texts import ACTIVE_JOB_TEXT, COOLDOWN_TEXT
 ProbeCacheKey = tuple[str, str, str]
 
 PENDING_TTL_SECONDS = 15 * 60  # How long confirmation buttons stay valid.
+PENDING_MAX_ENTRIES = 100
 PROBE_CACHE_TTL_SECONDS = 300
 PROBE_CACHE_MAX_ENTRIES = 50
 
@@ -87,10 +88,13 @@ def try_start_job(state: BotState, user_id: int) -> Optional[str]:
 
 
 def purge_expired(state: BotState) -> None:
-    """Forget confirmation buttons older than PENDING_TTL_SECONDS."""
+    """Forget expired confirmation buttons and stale cooldown timestamps."""
     now = time.monotonic()
     for token in [t for t, p in state.pending.items() if now - p.created > PENDING_TTL_SECONDS]:
         state.pending.pop(token, None)
+    cooldown = state.settings.user_cooldown_seconds
+    for uid in [u for u, ts in state.last_request.items() if now - ts >= cooldown]:
+        state.last_request.pop(uid, None)
 
 
 def probe_cache_key(url: str, platform: str, force_browser: bool) -> ProbeCacheKey:

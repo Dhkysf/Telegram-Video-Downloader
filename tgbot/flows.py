@@ -236,15 +236,21 @@ async def check_link(
             runner = make_runner(platform, url, candidate, probe)
             await process_download(context, message, user_id, platform, site, runner, state, status)
             return
-        await safe_delete(status)
-        status = None
         pending = PendingChoice(user_id, message, url, platform, site, probe, time.monotonic())
         await send_preview(pending, state)
+        try:
+            await safe_delete(status)
+        except TelegramError:
+            logger.debug("Could not delete status message after preview")
+        status = None
     except Forbidden:
         logger.info("User %s blocked the bot; stopping link check", user_id)
     except TelegramError as exc:
         logger.warning("Telegram error while checking a link: %s", type(exc).__name__, exc_info=True)
         try:
-            await safe_edit(status, ERROR_MESSAGES[ErrorCode.NETWORK])
+            if status is None:
+                await safe_reply(message, ERROR_MESSAGES[ErrorCode.NETWORK])
+            else:
+                await safe_edit(status, ERROR_MESSAGES[ErrorCode.NETWORK])
         except TelegramError:
             logger.debug("Could not report link-check failure")

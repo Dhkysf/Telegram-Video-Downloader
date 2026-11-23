@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from telegram import Update, __version__ as PTB_VERSION
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, NetworkError, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 from telegram.ext import ContextTypes
 
 from downloaders import MediaCandidate, browser_available, runtime_info
@@ -177,8 +177,12 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _answer(query, EXPIRED_TEXT, alert=True)
         try:
             await tg_call(lambda: query.edit_message_reply_markup(reply_markup=None), "drop buttons")
+        except Forbidden:
+            logger.info("User %s blocked the bot; expired buttons skipped", user.id)
         except BadRequest as exc:
             logger.debug("Ignoring BadRequest on expired buttons: %s", exc)
+        except TelegramError as exc:
+            logger.warning("Ignoring %s on expired buttons: %s", type(exc).__name__, exc)
         return
     if user.id != pending.user_id:
         await _answer(query, NOT_YOURS_TEXT, alert=True)
@@ -225,14 +229,16 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             label = f"video #{idx + 1}" if pending.probe.via_browser else "video ini"
             if audio:
                 label = f"audio dari {label}"
-            await finish_preview(pending, CHOSEN_NOTE.format(label=label))
+            if not await finish_preview(pending, CHOSEN_NOTE.format(label=label)):
+                return
             runner = make_runner(pending.platform, pending.url, candidate, pending.probe, audio=audio)
             await process_download(
                 context, pending.message, user.id, pending.platform, pending.site, runner, state,
                 audio=audio,
             )
         else:
-            await finish_preview(pending, BROWSER_NOTE)
+            if not await finish_preview(pending, BROWSER_NOTE):
+                return
             await check_link(
                 context, pending.message, user.id, pending.url, pending.platform, state, force_browser=True
             )

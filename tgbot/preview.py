@@ -9,10 +9,10 @@ from uuid import uuid4
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message, ReplyParameters
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, TelegramError
 
 from downloaders import MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB, MediaCandidate, ProbeResult, browser_available
-from tgbot.state import BotState, PendingChoice, purge_expired
+from tgbot.state import PENDING_MAX_ENTRIES, BotState, PendingChoice, purge_expired
 from tgbot.telegram_io import tg_call
 from tgbot.texts import AUDIO_BUTTON_TEXT, CHOOSE_QUESTION, CONFIRM_QUESTION
 
@@ -171,13 +171,18 @@ async def send_preview(pending: PendingChoice, state: BotState) -> None:
     pending.preview = preview
     pending.preview_html = text
     state.pending[token] = pending
+    while len(state.pending) > PENDING_MAX_ENTRIES:
+        state.pending.pop(next(iter(state.pending)))
 
 
-async def finish_preview(pending: PendingChoice, note: str) -> None:
-    """Remove the buttons from a preview and append a short note."""
+async def finish_preview(pending: PendingChoice, note: str) -> bool:
+    """Remove the buttons from a preview and append a short note.
+
+    Returns False when the user blocked the bot (Forbidden), True otherwise.
+    """
     preview = pending.preview
     if preview is None:
-        return
+        return True
     limit = CAPTION_LIMIT if pending.preview_is_photo else 4096
     body = pending.preview_html.rsplit("\n\n", 1)[0]  # Drop the question line.
     text = f"{body}\n\n{note}"
@@ -194,8 +199,14 @@ async def finish_preview(pending: PendingChoice, note: str) -> None:
                 lambda: preview.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=None),
                 "finish preview",
             )
+    except Forbidden:
+        logger.info("User %s blocked the bot; skipping preview edit", pending.user_id)
+        return False
     except BadRequest as exc:
         logger.debug("Ignoring BadRequest on preview edit: %s", exc)
+    except TelegramError as exc:
+        logger.warning("Ignoring %s on preview edit: %s", type(exc).__name__, exc)
+    return True
 
 
 def auto_pick(probe: ProbeResult) -> Optional[MediaCandidate]:

@@ -30,22 +30,27 @@ CLIENT_TIMEOUT_SECONDS: float = 30.0
 UPSTREAM_CONNECT_TIMEOUT: float = 15.0
 IDLE_TIMEOUT_SECONDS: float = 120.0
 RELAY_CHUNK: int = 64 * 1024
+MAX_TUNNELS: int = 64
 DROPPED_HEADERS: frozenset[str] = frozenset({"proxy-connection", "proxy-authorization", "connection", "keep-alive"})
 BLOCKED_RESPONSE: bytes = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 BAD_GATEWAY_RESPONSE: bytes = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 BAD_REQUEST_RESPONSE: bytes = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+BUSY_RESPONSE: bytes = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
 
 class GuardProxy:
     """A per-session forward proxy (HTTP + CONNECT) with the public-network guard."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_tunnels: int = MAX_TUNNELS) -> None:
         """Create the listening socket (not yet accepting)."""
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.bind((LISTEN_HOST, 0))
         self._server.listen(128)
         self._closed = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._slots = threading.BoundedSemaphore(max_tunnels)
+        self._lock = threading.Lock()
+        self._active_sockets: set[socket.socket] = set()
         self.blocked = 0  # Number of connections refused (for logs/tests).
 
     @property
@@ -60,13 +65,32 @@ class GuardProxy:
         self._thread.start()
         return self
 
+    def _register_socket(self, sock: socket.socket) -> bool:
+        with self._lock:
+            if self._closed.is_set():
+                return False
+            self._active_sockets.add(sock)
+            return True
+
     def __exit__(self, *_exc: object) -> None:
-        """Stop the proxy (open tunnels end when the browser closes them)."""
+        """Stop the proxy and close any active client/upstream sockets."""
         self._closed.set()
         try:
             self._server.close()
         except OSError:
             pass
+        with self._lock:
+            sockets = list(self._active_sockets)
+            self._active_sockets.clear()
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def _accept_loop(self) -> None:
         while not self._closed.is_set():
@@ -74,11 +98,31 @@ class GuardProxy:
                 client, _addr = self._server.accept()
             except OSError:
                 return  # Server socket closed.
-            threading.Thread(target=self._handle, args=(client,), name="guard-proxy-conn", daemon=True).start()
+            if not self._slots.acquire(blocking=False):
+                try:
+                    client.settimeout(1.0)
+                    client.sendall(BUSY_RESPONSE)
+                except OSError:
+                    pass
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
+            try:
+                threading.Thread(target=self._handle, args=(client,), name="guard-proxy-conn", daemon=True).start()
+            except Exception:
+                self._slots.release()
+                try:
+                    client.close()
+                except OSError:
+                    pass
 
     def _handle(self, client: socket.socket) -> None:
         upstream: Optional[socket.socket] = None
         try:
+            if not self._register_socket(client):
+                return
             client.settimeout(CLIENT_TIMEOUT_SECONDS)
             head, rest = _read_head(client)
             if head is None:
@@ -94,7 +138,7 @@ class GuardProxy:
                 host, _colon, port_text = target.rpartition(":")
                 host = host.strip("[]")
                 upstream = self._connect(client, host, int(port_text or 443))
-                if upstream is None:
+                if upstream is None or not self._register_socket(upstream):
                     return
                 client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 if rest:
@@ -105,7 +149,7 @@ class GuardProxy:
                     client.sendall(BAD_REQUEST_RESPONSE)
                     return
                 upstream = self._connect(client, url.hostname, url.port or 80)
-                if upstream is None:
+                if upstream is None or not self._register_socket(upstream):
                     return
                 path = url.path or "/"
                 if url.query:
@@ -126,12 +170,17 @@ class GuardProxy:
         except (OSError, ValueError):
             logger.debug("Proxy connection error", exc_info=True)
         finally:
+            with self._lock:
+                self._active_sockets.discard(client)
+                if upstream is not None:
+                    self._active_sockets.discard(upstream)
             for sock in (client, upstream):
                 if sock is not None:
                     try:
                         sock.close()
                     except OSError:
                         pass
+            self._slots.release()
 
     def _connect(self, client: socket.socket, host: str, port: int) -> Optional[socket.socket]:
         """Open an upstream connection under the guard; answer the client on failure."""
