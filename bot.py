@@ -23,7 +23,7 @@ from datetime import timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from uuid import uuid4
 
 from telegram import (
@@ -89,6 +89,7 @@ logger = logging.getLogger("video_bot")
 T = TypeVar("T")
 Downloader = Callable[[str, str, Optional[threading.Event]], DownloadResult]
 JobRunner = Callable[[str, threading.Event], DownloadResult]  # (job_id, cancel_event)
+ProbeCacheKey = tuple[str, str, str]
 
 # --- Defaults (overridable with environment variables) ------------------------
 DEFAULT_MAX_CONCURRENT_DOWNLOADS = 2
@@ -98,6 +99,8 @@ CANCEL_GRACE_SECONDS = 15.0  # Time a cancelled worker gets to stop before clean
 PROBE_TIMEOUT = 90.0  # Checking a link with yt-dlp.
 BROWSER_PROBE_TIMEOUT = 180.0  # Includes waiting for the single browser slot.
 PENDING_TTL_SECONDS = 15 * 60  # How long confirmation buttons stay valid.
+PROBE_CACHE_TTL_SECONDS = 300
+PROBE_CACHE_MAX_ENTRIES = 50
 MAX_TITLE_CHARS = 200
 CAPTION_LIMIT = 1024  # Telegram limit for photo captions.
 CONFIG_FILE: Path = PROJECT_ROOT / "config.py"
@@ -238,6 +241,8 @@ class BotState:
     last_request: dict[int, float] = field(default_factory=dict)
     active_users: set[int] = field(default_factory=set)
     pending: dict[str, PendingChoice] = field(default_factory=dict)
+    probe_cache: dict[ProbeCacheKey, tuple[float, ProbeResult]] = field(default_factory=dict)
+    in_flight_probes: dict[ProbeCacheKey, asyncio.Future[ProbeResult]] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -757,6 +762,40 @@ async def site_name(platform: str, url: str) -> str:
     return PLATFORM_NAMES[platform]
 
 
+def probe_cache_key(url: str, platform: str, force_browser: bool) -> ProbeCacheKey:
+    """Return the normalized cache key (url, platform, mode) for a probe."""
+    parsed = urlsplit(url)
+    userinfo, sep, hostport = parsed.netloc.rpartition("@")
+    netloc = f"{userinfo}{sep}{hostport.lower()}" if sep else hostport.lower()
+    normalized = urlunsplit((parsed.scheme.lower(), netloc, parsed.path, parsed.query, ""))
+    return (normalized, platform, "browser" if force_browser else "auto")
+
+
+def _cache_get(state: BotState, key: ProbeCacheKey) -> Optional[ProbeResult]:
+    """Return a cached ProbeResult if present and within TTL, else None."""
+    entry = state.probe_cache.get(key)
+    if entry is None:
+        return None
+    created, probe = entry
+    if time.monotonic() - created >= PROBE_CACHE_TTL_SECONDS:
+        state.probe_cache.pop(key, None)
+        return None
+    return probe
+
+
+def _cache_put(state: BotState, key: ProbeCacheKey, probe: ProbeResult) -> None:
+    """Cache a successful ProbeResult, purging expired and oldest entries."""
+    if probe.error is not ErrorCode.OK or not probe.candidates:
+        return
+    now = time.monotonic()
+    for k in [k for k, (created, _) in state.probe_cache.items() if now - created >= PROBE_CACHE_TTL_SECONDS]:
+        state.probe_cache.pop(k, None)
+    state.probe_cache.pop(key, None)
+    state.probe_cache[key] = (now, probe)
+    while len(state.probe_cache) > PROBE_CACHE_MAX_ENTRIES:
+        state.probe_cache.pop(next(iter(state.probe_cache)))
+
+
 async def probe_link(
     url: str, platform: str, state: BotState, status: Optional[Message], force_browser: bool
 ) -> ProbeResult:
@@ -991,24 +1030,53 @@ async def check_link(
 ) -> None:
     """Probe a link, then ask for confirmation (or download directly)."""
     site = await site_name(platform, url)
+    key = probe_cache_key(url, platform, force_browser)
     started = time.monotonic()
     status: Optional[Message] = None
     try:
         first_text = BROWSER_FORCED_TEXT if force_browser else CHECKING_TEXT.format(site=site)
-        status = await tg_call(lambda: message.reply_text(first_text), "status")
-        probe = await probe_link(url, platform, state, status, force_browser)
-        logger.info(
-            "Probe user=%s platform=%s site=%s outcome=%s candidates=%d browser=%s took=%.1fs detail=%s",
-            user_id, platform, site, probe.error.name, len(probe.candidates), probe.via_browser,
-            time.monotonic() - started, probe.detail[:200],
-        )
+        cached = _cache_get(state, key)
+        if cached is not None:
+            probe = cached
+            logger.info(
+                "probe cache hit: user=%s platform=%s site=%s mode=%s candidates=%d browser=%s",
+                user_id, platform, site, key[2], len(probe.candidates), probe.via_browser,
+            )
+        else:
+            inflight = state.in_flight_probes.get(key)
+            if inflight is not None:
+                status = await tg_call(lambda: message.reply_text(first_text), "status")
+                probe = await asyncio.shield(inflight)
+            else:
+                future: asyncio.Future[ProbeResult] = asyncio.get_running_loop().create_future()
+                state.in_flight_probes[key] = future
+                probe_result: Optional[ProbeResult] = None
+                try:
+                    status = await tg_call(lambda: message.reply_text(first_text), "status")
+                    probe_result = await probe_link(url, platform, state, status, force_browser)
+                    _cache_put(state, key, probe_result)
+                finally:
+                    state.in_flight_probes.pop(key, None)
+                    if not future.done():
+                        future.set_result(
+                            probe_result if probe_result is not None else ProbeResult(ErrorCode.UNKNOWN, detail="probe aborted")
+                        )
+                probe = probe_result
+            logger.info(
+                "Probe user=%s platform=%s site=%s outcome=%s candidates=%d browser=%s took=%.1fs detail=%s",
+                user_id, platform, site, probe.error.name, len(probe.candidates), probe.via_browser,
+                time.monotonic() - started, probe.detail[:200],
+            )
         if probe.error is not ErrorCode.OK or not probe.candidates:
             await safe_edit(status, ERROR_MESSAGES.get(probe.error, ERROR_MESSAGES[ErrorCode.UNKNOWN]))
             return
         if not state.settings.confirm_before_download:
             candidate = auto_pick(probe)
             if candidate is None:
-                await safe_edit(status, ONLY_ADS_TEXT)
+                if status is None:
+                    await safe_reply(message, ONLY_ADS_TEXT)
+                else:
+                    await safe_edit(status, ONLY_ADS_TEXT)
                 return
             runner = make_runner(platform, url, candidate, probe)
             await process_download(context, message, user_id, platform, site, runner, state, status)
