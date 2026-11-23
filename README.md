@@ -1,134 +1,189 @@
 # Telegram Video Downloader Bot
 
-A personal Telegram bot for downloading videos: send a link, the bot inspects the video, displays a preview, and sends the video file back to the chat. The bot runs on a Windows PC using python-telegram-bot (long polling) and yt-dlp, augmented with a headless browser (Microsoft Edge via Playwright) for sites unrecognized by yt-dlp.
+A personal Telegram bot for downloading videos on a Windows PC using `python-telegram-bot` (long polling) and `yt-dlp`. Send a link, inspect the preview, and confirm to receive the video (or audio) back in chat.
 
-## Features
+## 1. What it is
 
-- Supports TikTok, Instagram, X/Twitter, YouTube, and over 1,000 other sites via yt-dlp
-- Pre-download preview (title, duration, quality, estimated size, thumbnail) with confirmation buttons
-- Headless browser fallback: opens the page, clicks play, captures video streams (HLS/DASH/MP4), and flags potential ad streams
-- Dedicated ssstik.io scraper fallback for TikTok
-- Automatic resolution step-down (720p → 480p → 360p → 240p) to fit files under 50 MB
-- Audio-only results (e.g., SoundCloud) sent as audio messages
-- Public-network guard: rejects links resolving to local/LAN addresses
-- Per-user cooldown, concurrent download limits, and automatic temporary file cleanup
-- Rotating log files (`bot.log`, capped at ~6 MB)
+- **Multi-site support via `yt-dlp`**: TikTok (with an `ssstik.io` scraper fallback), Instagram, X/Twitter, YouTube, SoundCloud, and other public HTTP/HTTPS links.
+- **Preview and confirmation buttons**: Inspects title, duration, quality, estimated size, and thumbnail before downloading anything.
+- **"Audio saja" option**: Download audio-only MP3 from supported links (and audio-only sites like SoundCloud are sent as audio).
+- **Headless-browser fallback**: Uses Microsoft Edge via Playwright when `yt-dlp` finds nothing on a generic site, capturing video streams and flagging likely ads.
+- **5-minute probe cache**: Reuses recent probe results for 5 minutes (`PROBE_CACHE_TTL_SECONDS = 300`) to avoid re-probing the same link.
+- **`/ping` and `/health` commands**: Quick liveness check and full runtime status report.
+- **Auto `yt-dlp` update on start**: `start_bot.bat` updates `yt-dlp` once at launch before starting the bot loop.
+- **Local-network guard**: Blocks connections and browser traffic to loopback, private LAN, link-local, and CGNAT IP ranges.
+- **50 MB limit**: Enforces Telegram's 50 MB Bot API upload limit with automatic resolution step-down (`720p` → `480p` → `360p` → `240p`).
 
-## Installation
+## 2. Requirements
 
-Prerequisites:
+- **Windows 10 or 11**
+- **Python 3.10+**
+- **FFmpeg** (system binary, **not** the `ffmpeg` pip package) for merging video/audio and remuxing to MP4. Install with `winget`:
 
-- **Python 3.10 or newer**
-- **FFmpeg** (system binary, not a pip package) for merging video+audio and remuxing to MP4
-- **Microsoft Edge** (pre-installed on Windows 10/11) for the browser fallback
-
-Steps (from the project directory, no need to activate the venv):
-
-```cmd
-python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
+```powershell
 winget install Gyan.FFmpeg
 ```
 
-If FFmpeg is not in PATH, set the `FFMPEG_DIR` environment variable to the directory containing `ffmpeg.exe`. Do not install the pip package named `ffmpeg`.
+Expected result: `winget` installs FFmpeg and adds `ffmpeg.exe` to your `PATH` (open a new PowerShell window afterward).
 
-If neither Edge nor Chrome is installed, run this once:
+- **Microsoft Edge** (pre-installed on Windows 10/11), used by the headless-browser fallback.
 
-```cmd
-.venv\Scripts\python -m playwright install chromium
+## 3. Install
+
+Run these steps in PowerShell from the project folder (no venv activation needed):
+
+1. Create the virtual environment:
+
+```powershell
+python -m venv .venv
 ```
 
-## Configuration
+Expected result: A `.venv` folder is created in the project directory.
 
-The bot requires a bot token from [@BotFather](https://t.me/BotFather). Choose one of the following methods:
+2. Install Python dependencies:
 
-**1. Environment variable**
-
-```cmd
-set TELEGRAM_BOT_TOKEN=123456789:YOUR_TOKEN_HERE
-.venv\Scripts\python bot.py
+```powershell
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-**2. `config.py` file** in the same folder as `bot.py`:
+Expected result: `python-telegram-bot`, `yt-dlp`, `requests`, and `playwright` are installed inside `.venv`.
 
-```python
-TELEGRAM_BOT_TOKEN = "123456789:YOUR_TOKEN_HERE"
-```
+## 4. Configuration
 
-`config.py` is included in `.gitignore`. Never commit or share your real token. Environment variables take precedence: `config.py` is only read if `TELEGRAM_BOT_TOKEN` is not set in the environment.
-
-Optional settings (environment variables):
-
-| Variable | Default | Description |
-|---|---|---|
-| `MAX_CONCURRENT_DOWNLOADS` | `2` | Number of probe/download jobs allowed to run concurrently |
-| `JOB_TIMEOUT` | `300` | Timeout per download job (seconds) |
-| `USER_COOLDOWN_SECONDS` | `10` | Minimum cooldown between links per user (seconds) |
-| `ALLOWED_USER_IDS` | empty (allow all) | Comma-separated list of Telegram user IDs; other users are ignored |
-| `CONFIRM_BEFORE_DOWNLOAD` | enabled | `0`/`false`/`no`/`off`/`tidak` to download immediately without confirmation buttons |
-| `BROWSER_FALLBACK` | enabled | Same values to disable the headless browser fallback |
-| `FFMPEG_DIR` | empty | Directory containing `ffmpeg`, prepended to PATH |
-
-Since `config.py` is executed as Python, optional settings can also be defined there:
+Create a `config.py` file next to `bot.py` with your bot token from [@BotFather](https://t.me/BotFather):
 
 ```python
 import os
-os.environ.setdefault("ALLOWED_USER_IDS", "111111111,222222222")
-TELEGRAM_BOT_TOKEN = "123456789:YOUR_TOKEN_HERE"
+
+TELEGRAM_BOT_TOKEN = "123456789:ABCdef..."
+os.environ.setdefault("ALLOWED_USER_IDS", "123456789")
 ```
 
-## Usage
+> **How `config.py` works:** `config.py` is only read when `TELEGRAM_BOT_TOKEN` is **not** set in the environment. Using `os.environ.setdefault(...)` inside `config.py` lets you keep your optional settings in the same file.
+>
+> **Recommended:** Set `ALLOWED_USER_IDS` to your Telegram user ID so the bot silently ignores everyone else.
 
-1. Open a chat with the bot on Telegram and send `/start` (or `/help`) to view instructions.
-2. Send a video link. The link can be embedded inside a sentence, e.g., `check this out https://vt.tiktok.com/xxxx cool`. The bot uses the first link found in the message.
-3. The bot responds with "Memeriksa link…", then presents a preview with buttons:
-   - ✅ download this video
-   - 🔍 search again using the browser (generic sites only)
-   - ❌ cancel
-4. For sites other than TikTok/Instagram/X/YouTube, if yt-dlp fails to detect a video, the bot automatically opens the page using the browser and presents a screenshot along with up to 5 stream candidates ("Video N"). Candidates marked with ⚠️ are likely advertisements.
-5. Once a button is pressed, the bot downloads the stream and replies with the video (or audio) file.
+### Environment Variables
 
-Notes:
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | *(required)* | Telegram bot token from `@BotFather`. |
+| `ALLOWED_USER_IDS` | *(unset — everyone allowed)* | Comma-separated Telegram user IDs allowed to use the bot. Invalid values deny everyone. |
+| `MAX_CONCURRENT_DOWNLOADS` | `2` | Maximum concurrent probes/downloads across all users. |
+| `JOB_TIMEOUT` | `300` | Seconds before a download job times out. |
+| `USER_COOLDOWN_SECONDS` | `10` | Per-user cooldown in seconds between links. |
+| `CONFIRM_BEFORE_DOWNLOAD` | `true` | Show preview + confirmation buttons before downloading (`0`/`false`/`no`/`off`/`tidak` disables it). |
+| `BROWSER_FALLBACK` | `true` | Enable headless-browser fallback when `yt-dlp` finds nothing (`0`/`false`/`no`/`off`/`tidak` disables it). |
+| `FFMPEG_DIR` | *(unset)* | Directory containing `ffmpeg.exe`, prepended to `PATH` at startup. |
 
-- Buttons can only be pressed by the user who sent the link and expire after 15 minutes.
-- A user can only have one active job at a time and must wait through the cooldown period (default 10 seconds) before submitting another link.
+## 5. Running
 
-## Windows Deployment
+### Manual run
 
-Two helper scripts are provided to keep the bot running in the background:
+```powershell
+.venv\Scripts\python bot.py
+```
 
-- **`start_bot.bat`**: Runs `.venv\Scripts\python.exe bot.py` in a restart loop. If the bot stops or crashes, it automatically restarts after 10 seconds. Console output (e.g., crash tracebacks) is written to `bot.console.log`; output from the previous run is preserved as `bot.console.prev.log`.
-- **`start_bot_hidden.vbs`**: Launches `start_bot.bat` without opening a command prompt window.
+Expected result: The bot starts polling Telegram and writes logs to `bot.log` (and echoes them to the console). Press `Ctrl+C` to stop.
 
-The bot's own application logs are saved in `bot.log` and automatically rotate every 1 MB (`bot.log.1` … `bot.log.5`).
+### Hidden autostart on Windows
 
-To run the bot automatically on user login:
+1. Right-click `start_bot_hidden.vbs` → **Create shortcut**.
+2. Press `Win+R`, type `shell:startup`, and press `Enter`.
+3. Move the shortcut into the Startup folder.
 
-1. Press `Win + R`, type `shell:startup`, and press Enter.
-2. Create a shortcut to `start_bot_hidden.vbs` inside the opened folder.
+`start_bot_hidden.vbs` launches `start_bot.bat` with no visible window.
 
-To stop the bot: open Task Manager, then terminate both the `python.exe` process (the bot) **and** the `cmd.exe` process running `start_bot.bat`. If only `python.exe` is killed, the restart loop will launch it again.
+### What `start_bot.bat` does
 
-> Both scripts must maintain CRLF (Windows) line endings. Stop the bot before making edits to `start_bot.bat`.
+1. Runs `.venv\Scripts\python.exe -m pip install -U --disable-pip-version-check yt-dlp` once at startup (logging to `bot.update.log`). If the update fails, it continues with the installed version.
+2. Starts `.venv\Scripts\python.exe bot.py` in a loop, redirecting console output to `bot.console.log` (keeping the previous run in `bot.console.prev.log`).
+3. If `bot.py` exits, it waits 10 seconds and restarts it automatically.
 
-## Troubleshooting
+### Logs
 
-**FFmpeg not found**
-The log displays `FFmpeg not found: merging video/audio and remuxing to MP4 may fail`. The bot will still run, but videos with separated video and audio tracks (such as YouTube) may fail to merge. Solution: run `winget install Gyan.FFmpeg`, then open a new terminal (or restart the bot) so PATH updates take effect. Alternatively, set `FFMPEG_DIR` to the folder containing `ffmpeg.exe`. Verify with `ffmpeg -version`.
+- `bot.log`: Main rotating application log (1 MB per file, up to 5 backups: `bot.log.1` .. `bot.log.5`).
+- `bot.update.log`: Output from the startup `yt-dlp` update.
+- `bot.console.log` / `bot.console.prev.log`: Console stdout/stderr from `start_bot.bat`.
 
-**File exceeds 50 MB**
-Telegram bots can only upload files up to 50 MB. The bot automatically attempts lower resolutions (down to 240p). If the file is still too large, the bot replies with "❌ Video terlalu besar (lebih dari 50 MB)". For long videos, this is a platform limitation that cannot be bypassed by the bot.
+### Stopping the hidden bot
 
-**Link not supported**
-A reply saying "🔍 Link ini tidak didukung…" means the bot found no downloadable video: yt-dlp failed, and (for generic sites) the browser fallback also found no playable streams. Common causes:
+Open **Task Manager** (`Ctrl+Shift+Esc`), find **Windows Command Processor** (`cmd.exe`) running `start_bot.bat`, and end it **before** ending `python.exe` (otherwise `start_bot.bat` will restart `bot.py` after 10 seconds).
 
-- DRM-protected videos (Netflix, Disney+, etc.) or live streams: not supported.
-- Private content or pages requiring login. For Instagram, place a Netscape-formatted cookie file named `instagram_cookies.txt` in the project root directory.
-- yt-dlp is outdated. Update it via `.venv\Scripts\python -m pip install -U yt-dlp`, then restart the bot.
-- Links resolving to local/LAN addresses (`localhost`, `192.168.x.x`, etc.) are intentionally blocked.
+## 6. Using the bot
 
-**Invalid or missing token**
-- `TELEGRAM_BOT_TOKEN is not set…`: The token is missing from both environment variables and `config.py`.
-- `Telegram rejected TELEGRAM_BOT_TOKEN; check the token with @BotFather`: The token is invalid or has been revoked. Generate a new token via @BotFather.
+1. Send any supported video link to the bot.
+2. The bot probes the link and replies with a preview (thumbnail or browser screenshot) and inline buttons:
+   - **Ya, unduh** (or numbered stream buttons when multiple streams are found)
+   - **Audio saja** (download audio as MP3)
+   - **cari pakai browser** (retry with the headless browser if `yt-dlp` picked the wrong thing)
+   - **Batal** (cancel)
+3. **⚠️ `kemungkinan iklan`**: Flagged on browser-captured streams whose URL, duration, or metadata matches ad heuristics. Avoid picking these unless you know it is the actual video.
+4. **Button expiry**: Confirmation buttons expire after **15 minutes** (`PENDING_TTL_SECONDS = 900`).
 
-In both cases, the bot exits with code 1. When running under `start_bot.bat`, these messages appear in `bot.log`, and the batch script will retry every 10 seconds until the token is corrected.
+### Commands
+
+- `/start` or `/help`: Show the welcome message and usage instructions.
+- `/ping`: Quick check that the bot is alive (`Pong!`).
+- `/health`: Show uptime, active slots, pending choices, probe cache count, FFmpeg status, browser fallback status, Playwright version, `yt-dlp` version, `python-telegram-bot` version, and `temp_downloads/` usage.
+
+## 7. Instagram cookies
+
+Some Instagram posts/reels require login cookies:
+
+1. Install the **Get cookies.txt LOCALLY** browser extension.
+2. Log in using a **secondary** Instagram account (never your main account).
+3. Export cookies for `instagram.com` and save the file as `instagram_cookies.txt` in the project root (next to `bot.py`).
+4. **Never share or commit `instagram_cookies.txt`.**
+
+## 8. Limits
+
+- **50 MB Bot API limit**: Files larger than 50 MB cannot be sent by the bot.
+- **DRM**: DRM-protected streams are detected and dropped.
+- **Live streams**: Live streams are skipped/rejected.
+- **Login-only content**: Content behind logins or paywalls is not supported (except optional Instagram cookies).
+- **CAPTCHA sites**: Sites gated by CAPTCHAs or anti-bot challenges are not supported.
+- **Ad detection is a heuristic**: `kemungkinan iklan` flags likely ads based on hostnames and stream metadata, not a guarantee.
+
+## 9. Troubleshooting
+
+- **Bot does not start or crashes**: Check `bot.log` and `bot.console.log` for the error.
+- **Downloads fail on a site that used to work**: Update `yt-dlp`:
+
+```powershell
+.venv\Scripts\python -m pip install -U yt-dlp
+```
+
+Expected result: `yt-dlp` updates to the latest version.
+
+- **FFmpeg not found**: Install it with `winget install Gyan.FFmpeg` or set `FFMPEG_DIR` to the folder containing `ffmpeg.exe`.
+- **Browser fallback unavailable**: Ensure Microsoft Edge is installed, or run `.venv\Scripts\python -m playwright install chromium` if neither Edge nor Chrome is present.
+- **Bot is silent / ignores messages**: Check `ALLOWED_USER_IDS` in `config.py` or your environment variables and verify your Telegram user ID is listed.
+
+## 10. Development
+
+### Project layout
+
+```text
+bot.py                  Entry point (main, build_application)
+tgbot/                  Telegram bot package (handlers, flows, preview, state, settings, texts, links, workers, telegram_io)
+downloaders/            Media probing & downloading (ytdlp, tiktok, probe, browser, streaminfo, guardproxy, common)
+tests/smoke_test.py     Offline smoke tests
+start_bot.bat           Windows restart loop + yt-dlp auto-update
+start_bot_hidden.vbs    Hidden launcher for start_bot.bat
+requirements.txt        Python dependencies
+```
+
+### Running tests
+
+```powershell
+.venv\Scripts\python tests\smoke_test.py
+```
+
+Expected result: All smoke tests pass (`OK`).
+
+### Contributing
+
+- Read [AGENTS.md](AGENTS.md) and `.agents/rules/` before making changes (especially if you are an AI coding agent).
+- Use **Conventional Commits** (`type(section): description`, e.g. `feat(tiktok): support slideshow download`).
+- **Never commit** `config.py`, `instagram_cookies.txt`, `bot.log`, `.env`, `.venv/`, or `temp_downloads/`.
