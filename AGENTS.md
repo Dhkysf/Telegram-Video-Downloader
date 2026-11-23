@@ -41,7 +41,21 @@ Platforms and runtime:
 ## Layout
 
 ```
-bot.py                  Entry point. Startup, handlers, Telegram I/O, preview/confirm UI.
+bot.py                  Entry point: main() and build_application() only.
+tgbot/                  Telegram bot package (one-way imports: texts/links/settings
+                        -> state -> telegram_io -> preview/workers -> flows -> handlers).
+  __init__.py           Package marker (no imports or side effects).
+  texts.py              User-facing Bahasa Indonesia strings + ERROR_MESSAGES.
+  settings.py           Settings, load_settings, env helpers, load_token, logging/RedactingFormatter, configure_ffmpeg.
+  links.py              URL extraction, detect_platform, site_name, PLATFORM_* maps.
+  state.py              BotState, PendingChoice, probe cache, get_state, is_allowed, try_start_job.
+  telegram_io.py        tg_call, safe_reply/edit/delete, send_video_file.
+  workers.py            run_worker, late cleanup, DOWNLOADERS, make_runner.
+  preview.py            Format helpers, build_preview, send_preview, finish_preview, auto_pick.
+  flows.py              probe_link, check_link, process_download.
+  handlers.py           start/help, ping, health, handle_text, handle_choice, error_handler.
+tests/
+  smoke_test.py         Offline smoke tests (stdlib + PTB only, no token/network).
 downloaders/            Everything that touches the network for media. Never imports telegram.
   __init__.py           Re-exports the public API (keep __all__ in sync).
   common.py             Shared constants, ErrorCode, DownloadResult, MediaCandidate,
@@ -110,9 +124,9 @@ the environment**. The owner sets extra options there with
 because of this. Do not break this path, and do not move settings loading
 before `load_token()`.
 
-Fixed timeouts in `bot.py`: `PROBE_TIMEOUT=90`, `BROWSER_PROBE_TIMEOUT=180`
-(includes waiting for the single browser slot), and `PENDING_TTL_SECONDS=900`
-(how long buttons stay valid).
+Fixed timeouts: `PROBE_TIMEOUT=90` and `BROWSER_PROBE_TIMEOUT=180` in `tgbot/flows.py`
+(includes waiting for the single browser slot), and `PENDING_TTL_SECONDS=900` in
+`tgbot/state.py` (how long buttons stay valid).
 
 ## Architecture invariants (do not break)
 
@@ -369,9 +383,10 @@ There is no test suite in the repo. Before reporting done, run the checks that
 apply, and say plainly which ones you ran and which you could not run (e.g.
 nothing here talks to the real Telegram API without a token).
 
-1. **Compile and lint:** `python -m compileall -q bot.py downloaders` (works
+1. **Compile and lint:** `python -m compileall -q bot.py tgbot downloaders tests` (works
    on Windows shells too). If available, also
-   `python -m pyflakes bot.py downloaders/`.
+   `python -m pyflakes bot.py tgbot/ downloaders/ tests/`.
+   Run `python tests/smoke_test.py` before every commit.
 2. **Pure logic.** Test `extract_first_url` and `detect_platform` with real PTB
    `Message`/`MessageEntity` objects (`parse_entities` needs them).
 
@@ -389,12 +404,13 @@ nothing here talks to the real Telegram API without a token).
    - Patch `telegram.Message.reply_text` and `reply_photo` at class level
      with async fakes that return objects with
      `edit_text`/`edit_caption`/`delete`.
-   - Patch `bot.probe_ytdlp`, `bot.probe_with_browser`,
-     `bot.download_browser_stream`, and `bot.browser_available`, plus
+   - Patch `tgbot.flows.probe_ytdlp`, `tgbot.flows.probe_with_browser`,
+     `tgbot.workers.download_browser_stream`, `tgbot.preview.browser_available`,
+     `tgbot.settings.browser_available`, `tgbot.handlers.runtime_info`, plus
      `downloaders.probe.browser_available`.
-   - Swap `bot.DOWNLOADERS` entries for fakes that write `{job_id}.mp4` into
+   - Swap `tgbot.workers.DOWNLOADERS` entries for fakes that write `{job_id}.mp4` into
      `TEMP_DIR`.
-   - Drive buttons by calling `bot.handle_choice` with
+   - Drive buttons by calling `tgbot.handlers.handle_choice` with
      `SimpleNamespace(callback_query=FakeQuery(data), effective_user=User(...))`.
 
    Cover these cases, and check that `TEMP_DIR` and `active_users` are empty
@@ -487,8 +503,8 @@ nothing here talks to the real Telegram API without a token).
 
 ## Git & Commit
 
-- Once a task is complete and the code has been tested, make a commit.
-- Before committing, run `git status` and `git diff` to see what has changed.
+- Once a task is complete and the code has been tested (including `python tests/smoke_test.py`), make a commit.
+- Before committing, run `git status` and `git diff` to see what has changed. Review uncommitted changes using the `ponytail-review` skill. Fix all identified bugs and risks, then double-check. Other findings (Speed, Lean) should simply be reported; do not address them without my permission.
 - Use `git add <filename>` only for files related to that task. Avoid `git add .`.
 - NEVER commit `config.py`, `.env`, cookie files, `bot.log`, `.venv/`, or `temp_downloads/`.
 - Commit messages must follow the Conventional Commits format: `type(section): description`
@@ -499,5 +515,5 @@ nothing here talks to the real Telegram API without a token).
 - One commit per type of change. Do not combine new features and bug fixes in a single commit.
 - If a commit is rejected by the pre-commit hook, fix the issue and try again. Do not use `--no-verify`.
 - DO NOT `git push` unless I ask you to.
+- At the end of your response, include a summary of the review results: what was fixed and what was intentionally left as is.
 
-Translated with DeepL.com (free version)

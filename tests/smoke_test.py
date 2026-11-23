@@ -20,8 +20,15 @@ if str(PROJECT_ROOT) not in sys.path:
 from telegram import Chat, Message, MessageEntity, Update, User
 from telegram.constants import ParseMode
 
-import bot
 from downloaders import DownloadResult, ErrorCode, MediaCandidate, ProbeResult, TEMP_DIR
+import tgbot.flows
+import tgbot.handlers
+import tgbot.links
+import tgbot.preview
+import tgbot.settings
+import tgbot.state
+import tgbot.texts
+import tgbot.workers
 
 
 class _HTMLValidator(HTMLParser):
@@ -126,7 +133,7 @@ def make_message(
     )
 
 
-def make_state(**overrides: object) -> bot.BotState:
+def make_state(**overrides: object) -> tgbot.state.BotState:
     settings_kwargs: dict[str, object] = {
         "max_concurrent_downloads": 2,
         "job_timeout": 30.0,
@@ -138,8 +145,8 @@ def make_state(**overrides: object) -> bot.BotState:
     for key in list(settings_kwargs):
         if key in overrides:
             settings_kwargs[key] = overrides.pop(key)
-    settings = bot.Settings(**settings_kwargs)  # type: ignore[arg-type]
-    state = bot.BotState(
+    settings = tgbot.settings.Settings(**settings_kwargs)  # type: ignore[arg-type]
+    state = tgbot.state.BotState(
         settings=settings,
         semaphore=asyncio.Semaphore(settings.max_concurrent_downloads),
     )
@@ -148,7 +155,7 @@ def make_state(**overrides: object) -> bot.BotState:
     return state
 
 
-def make_context(state: bot.BotState, fake_bot: FakeBot | None = None) -> SimpleNamespace:
+def make_context(state: tgbot.state.BotState, fake_bot: FakeBot | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         application=SimpleNamespace(bot_data={"state": state}),
         bot=fake_bot or FakeBot(),
@@ -193,22 +200,22 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_link_extraction_and_platform_detection(self) -> None:
         msg1 = make_message("lihat video ini https://www.youtube.com/watch?v=abc123 ya")
-        self.assertEqual(bot.extract_first_url(msg1), "https://www.youtube.com/watch?v=abc123")
+        self.assertEqual(tgbot.links.extract_first_url(msg1), "https://www.youtube.com/watch?v=abc123")
 
         ent_url = MessageEntity(MessageEntity.URL, 6, 10)
         msg2 = make_message("check youtu.be/x now", entities=(ent_url,))
-        self.assertEqual(bot.extract_first_url(msg2), "https://youtu.be/x")
+        self.assertEqual(tgbot.links.extract_first_url(msg2), "https://youtu.be/x")
 
         ent_link = MessageEntity(MessageEntity.TEXT_LINK, 0, 4, url="https://tiktok.com/@a/video/1")
         msg3 = make_message("klik di sini", entities=(ent_link,))
-        self.assertEqual(bot.extract_first_url(msg3), "https://tiktok.com/@a/video/1")
+        self.assertEqual(tgbot.links.extract_first_url(msg3), "https://tiktok.com/@a/video/1")
 
-        self.assertEqual(bot.detect_platform("https://x.com@evil.com/v"), "generic")
-        self.assertEqual(bot.detect_platform("https://www.tiktok.com/@a/video/1"), "tiktok")
-        self.assertEqual(bot.detect_platform("https://x.com/i/status/1"), "twitter")
-        self.assertEqual(bot.detect_platform("https://www.instagram.com/reel/1/"), "instagram")
-        self.assertEqual(bot.detect_platform("https://youtu.be/abc"), "youtube")
-        self.assertEqual(bot.detect_platform("https://example.com/video.mp4"), "generic")
+        self.assertEqual(tgbot.links.detect_platform("https://x.com@evil.com/v"), "generic")
+        self.assertEqual(tgbot.links.detect_platform("https://www.tiktok.com/@a/video/1"), "tiktok")
+        self.assertEqual(tgbot.links.detect_platform("https://x.com/i/status/1"), "twitter")
+        self.assertEqual(tgbot.links.detect_platform("https://www.instagram.com/reel/1/"), "instagram")
+        self.assertEqual(tgbot.links.detect_platform("https://youtu.be/abc"), "youtube")
+        self.assertEqual(tgbot.links.detect_platform("https://example.com/video.mp4"), "generic")
 
         for local_url in (
             "http://localhost/video.mp4",
@@ -219,13 +226,13 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
             "http://nas.local/v",
             "http://router.lan/v",
         ):
-            self.assertIsNone(bot.detect_platform(local_url), f"Expected None for {local_url}")
+            self.assertIsNone(tgbot.links.detect_platform(local_url), f"Expected None for {local_url}")
 
         probe = ProbeResult(
             ErrorCode.OK,
             candidates=[MediaCandidate(url="https://youtube.com/watch?v=1", title="A <script> & B", duration=65, height=720)],
         )
-        html_text, _markup, kind = bot.build_preview("YouTube", probe, allow_browser=False)
+        html_text, _markup, kind = tgbot.preview.build_preview("YouTube", probe, allow_browser=False)
         self.assertEqual(kind, "text")
         self.assertIn("A &lt;script&gt; &amp; B", html_text)
         assert_valid_html(html_text)
@@ -240,17 +247,17 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
             probe_calls += 1
             return ProbeResult(ErrorCode.NOT_FOUND)
 
-        with patch.object(bot, "probe_ytdlp", fake_probe):
+        with patch.object(tgbot.flows, "probe_ytdlp", fake_probe):
             state.active_users.add(100)
             msg = make_message("https://youtube.com/watch?v=1", user_id=100)
-            await bot.handle_text(Update(1, message=msg), ctx)
-            self.assertEqual(self.sent[-1].text, bot.ACTIVE_JOB_TEXT)
+            await tgbot.handlers.handle_text(Update(1, message=msg), ctx)
+            self.assertEqual(self.sent[-1].text, tgbot.texts.ACTIVE_JOB_TEXT)
             self.assertEqual(probe_calls, 0)
             state.active_users.discard(100)
 
-            await bot.handle_text(Update(2, message=msg), ctx)
+            await tgbot.handlers.handle_text(Update(2, message=msg), ctx)
             self.assertEqual(probe_calls, 1)
-            await bot.handle_text(Update(3, message=msg), ctx)
+            await tgbot.handlers.handle_text(Update(3, message=msg), ctx)
             self.assertEqual(probe_calls, 1)
             self.assertIn("Pelan-pelan ya", self.sent[-1].text)
         self.assertEqual(state.active_users, set())
@@ -270,11 +277,11 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
             return DownloadResult(out, ErrorCode.OK)
 
         with (
-            patch.object(bot, "probe_ytdlp", return_value=probe),
-            patch.dict(bot.DOWNLOADERS, {"youtube": fake_yt}),
+            patch.object(tgbot.flows, "probe_ytdlp", return_value=probe),
+            patch.dict(tgbot.workers.DOWNLOADERS, {"youtube": fake_yt}),
         ):
             msg = make_message("https://youtube.com/watch?v=abc", user_id=100)
-            await bot.handle_text(Update(1, message=msg), ctx)
+            await tgbot.handlers.handle_text(Update(1, message=msg), ctx)
             self.assertEqual(len(state.pending), 1)
             token = next(iter(state.pending))
             callbacks = extract_callbacks(self.sent[-1].reply_markup)
@@ -283,7 +290,7 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
 
             query = FakeQuery(f"dl:{token}:0")
             choice_update = SimpleNamespace(callback_query=query, effective_user=User(100, "u", False))
-            await bot.handle_choice(choice_update, ctx)
+            await tgbot.handlers.handle_choice(choice_update, ctx)
 
         self.assertEqual(len(fake_bot.videos), 1)
         self.assertEqual(fake_bot.videos[0]["bytes"], b"MP4DATA")
@@ -317,25 +324,25 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
             return DownloadResult(out, ErrorCode.OK)
 
         with (
-            patch.object(bot, "probe_ytdlp", return_value=yt_probe),
-            patch.object(bot, "probe_with_browser", return_value=br_probe),
-            patch.object(bot, "download_browser_stream", fake_br_dl),
-            patch.object(bot, "browser_available", return_value=True),
+            patch.object(tgbot.flows, "probe_ytdlp", return_value=yt_probe),
+            patch.object(tgbot.flows, "probe_with_browser", return_value=br_probe),
+            patch.object(tgbot.workers, "download_browser_stream", fake_br_dl),
+            patch.object(tgbot.preview, "browser_available", return_value=True),
         ):
             msg = make_message("https://example.com/watch", user_id=100)
-            await bot.handle_text(Update(1, message=msg), ctx)
+            await tgbot.handlers.handle_text(Update(1, message=msg), ctx)
             token1 = next(iter(state.pending))
             self.assertIn(f"br:{token1}", extract_callbacks(self.sent[-1].reply_markup))
 
             q_br = FakeQuery(f"br:{token1}")
-            await bot.handle_choice(SimpleNamespace(callback_query=q_br, effective_user=User(100, "u", False)), ctx)
+            await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_br, effective_user=User(100, "u", False)), ctx)
             self.assertEqual(len(state.pending), 1)
             token2 = next(iter(state.pending))
             self.assertEqual(self.sent[-1].photo, b"PNGDATA")
             self.assertIn(f"dl:{token2}:1", extract_callbacks(self.sent[-1].reply_markup))
 
             q_dl = FakeQuery(f"dl:{token2}:1")
-            await bot.handle_choice(SimpleNamespace(callback_query=q_dl, effective_user=User(100, "u", False)), ctx)
+            await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_dl, effective_user=User(100, "u", False)), ctx)
 
         self.assertEqual(len(fake_bot.videos), 1)
         self.assertEqual(fake_bot.videos[0]["bytes"], b"BROWSERMP4")
@@ -347,28 +354,28 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
         ctx = make_context(state)
         probe = ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://youtube.com/watch?v=1", title="Vid", duration=5)])
 
-        with patch.object(bot, "probe_ytdlp", return_value=probe):
-            await bot.handle_text(Update(1, message=make_message("https://youtube.com/watch?v=1")), ctx)
+        with patch.object(tgbot.flows, "probe_ytdlp", return_value=probe):
+            await tgbot.handlers.handle_text(Update(1, message=make_message("https://youtube.com/watch?v=1")), ctx)
             token = next(iter(state.pending))
 
             q_other = FakeQuery(f"dl:{token}:0")
-            await bot.handle_choice(SimpleNamespace(callback_query=q_other, effective_user=User(200, "other", False)), ctx)
-            self.assertEqual(q_other.answers, [(bot.NOT_YOURS_TEXT, True)])
+            await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_other, effective_user=User(200, "other", False)), ctx)
+            self.assertEqual(q_other.answers, [(tgbot.texts.NOT_YOURS_TEXT, True)])
             self.assertIn(token, state.pending)
 
             q_cancel = FakeQuery(f"cx:{token}")
-            await bot.handle_choice(SimpleNamespace(callback_query=q_cancel, effective_user=User(100, "owner", False)), ctx)
+            await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_cancel, effective_user=User(100, "owner", False)), ctx)
             self.assertEqual(q_cancel.answers, [("Dibatalkan", False)])
             self.assertNotIn(token, state.pending)
-            self.assertIn(bot.CANCELLED_NOTE, self.sent[-1].text)
+            self.assertIn(tgbot.texts.CANCELLED_NOTE, self.sent[-1].text)
 
             state.last_request.clear()
-            await bot.handle_text(Update(2, message=make_message("https://youtube.com/watch?v=2")), ctx)
+            await tgbot.handlers.handle_text(Update(2, message=make_message("https://youtube.com/watch?v=2")), ctx)
             token2 = next(iter(state.pending))
             state.pending[token2].created = time.monotonic() - 1000
             q_exp = FakeQuery(f"dl:{token2}:0")
-            await bot.handle_choice(SimpleNamespace(callback_query=q_exp, effective_user=User(100, "owner", False)), ctx)
-            self.assertEqual(q_exp.answers, [(bot.EXPIRED_TEXT, True)])
+            await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_exp, effective_user=User(100, "owner", False)), ctx)
+            self.assertEqual(q_exp.answers, [(tgbot.texts.EXPIRED_TEXT, True)])
             self.assertEqual(q_exp.markup_edits, [None])
             self.assertNotIn(token2, state.pending)
         self.assertEqual(state.active_users, set())
@@ -383,20 +390,20 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
             calls += 1
             return ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://youtube.com/watch?v=abc", title="Cached", duration=10)])
 
-        with patch.object(bot, "probe_ytdlp", fake_probe):
-            await bot.handle_text(Update(1, message=make_message("https://youtube.com/watch?v=abc")), ctx)
-            await bot.handle_text(Update(2, message=make_message("https://YOUTUBE.COM/watch?v=abc#frag")), ctx)
+        with patch.object(tgbot.flows, "probe_ytdlp", fake_probe):
+            await tgbot.handlers.handle_text(Update(1, message=make_message("https://youtube.com/watch?v=abc")), ctx)
+            await tgbot.handlers.handle_text(Update(2, message=make_message("https://YOUTUBE.COM/watch?v=abc#frag")), ctx)
             self.assertEqual(calls, 1)
 
-            key = bot.probe_cache_key("https://youtube.com/watch?v=abc", "youtube", False)
+            key = tgbot.state.probe_cache_key("https://youtube.com/watch?v=abc", "youtube", False)
             created, cached_probe = state.probe_cache[key]
             state.probe_cache[key] = (created - 400, cached_probe)
-            await bot.handle_text(Update(3, message=make_message("https://youtube.com/watch?v=abc")), ctx)
+            await tgbot.handlers.handle_text(Update(3, message=make_message("https://youtube.com/watch?v=abc")), ctx)
             self.assertEqual(calls, 2)
 
-        with patch.object(bot, "probe_ytdlp", return_value=ProbeResult(ErrorCode.NOT_FOUND)):
+        with patch.object(tgbot.flows, "probe_ytdlp", return_value=ProbeResult(ErrorCode.NOT_FOUND)):
             state.probe_cache.clear()
-            await bot.handle_text(Update(4, message=make_message("https://youtube.com/watch?v=missing")), ctx)
+            await tgbot.handlers.handle_text(Update(4, message=make_message("https://youtube.com/watch?v=missing")), ctx)
             self.assertEqual(state.probe_cache, {})
         self.assertEqual(state.active_users, set())
 
@@ -407,13 +414,13 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
         # Hold the single download slot to verify /ping and /health never block on it.
         await state.semaphore.acquire()
         try:
-            await bot.ping_command(Update(1, message=make_message("/ping", user_id=999)), ctx)
-            await bot.start_command(Update(2, message=make_message("/start", user_id=999)), ctx)
-            await bot.handle_text(Update(3, message=make_message("https://youtube.com/watch?v=1", user_id=999)), ctx)
-            await bot.health_command(Update(4, message=make_message("/health", user_id=999)), ctx)
+            await tgbot.handlers.ping_command(Update(1, message=make_message("/ping", user_id=999)), ctx)
+            await tgbot.handlers.start_command(Update(2, message=make_message("/start", user_id=999)), ctx)
+            await tgbot.handlers.handle_text(Update(3, message=make_message("https://youtube.com/watch?v=1", user_id=999)), ctx)
+            await tgbot.handlers.health_command(Update(4, message=make_message("/health", user_id=999)), ctx)
             self.assertEqual(self.sent, [])
 
-            await bot.ping_command(Update(5, message=make_message("/ping", user_id=100)), ctx)
+            await tgbot.handlers.ping_command(Update(5, message=make_message("/ping", user_id=100)), ctx)
             self.assertIn("Pong!", self.sent[-1].text)
 
             fake_info = {
@@ -425,9 +432,9 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
                 "temp_bytes": 0,
                 "disk_free_bytes": 10 * 1024**3,
             }
-            with patch.object(bot, "runtime_info", return_value=fake_info):
+            with patch.object(tgbot.handlers, "runtime_info", return_value=fake_info):
                 await asyncio.wait_for(
-                    bot.health_command(Update(6, message=make_message("/health", user_id=100)), ctx),
+                    tgbot.handlers.health_command(Update(6, message=make_message("/health", user_id=100)), ctx),
                     timeout=1.0,
                 )
             health_html = self.sent[-1].text
