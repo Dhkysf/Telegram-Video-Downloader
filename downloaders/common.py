@@ -7,6 +7,7 @@ and cleanup are triggered explicitly from ``bot.py`` at startup.
 
 from __future__ import annotations
 
+import importlib.metadata
 import ipaddress
 import logging
 import random
@@ -400,3 +401,75 @@ def prepare_temp_dir() -> int:
     """
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     return clear_temp_dir()
+
+
+def runtime_info() -> dict[str, Any]:
+    """Collect versions, tool availability, temp stats and free disk space.
+
+    Never raises and never returns file paths or secrets; missing values
+    become ``"?"`` or ``None``.
+    """
+    yt_dlp_version = "?"
+    try:
+        import yt_dlp.version  # noqa: PLC0415
+
+        yt_dlp_version = str(yt_dlp.version.__version__)
+    except Exception:
+        try:
+            yt_dlp_version = importlib.metadata.version("yt-dlp")
+        except Exception:
+            pass
+
+    browser_ok = False
+    playwright_version: Optional[str] = None
+    try:
+        import playwright  # noqa: PLC0415
+
+        browser_ok = True
+        playwright_version = getattr(playwright, "__version__", None) or importlib.metadata.version("playwright")
+    except Exception:
+        pass
+
+    ffmpeg_ok: Optional[bool]
+    try:
+        ffmpeg_ok = shutil.which("ffmpeg") is not None
+    except Exception:
+        ffmpeg_ok = None
+
+    temp_files: Optional[int] = None
+    temp_bytes: Optional[int] = None
+    try:
+        if TEMP_DIR.exists():
+            count = 0
+            total = 0
+            for entry in TEMP_DIR.rglob("*"):
+                try:
+                    if entry.is_file():
+                        count += 1
+                        total += entry.stat().st_size
+                except OSError:
+                    pass
+            temp_files = count
+            temp_bytes = total
+        else:
+            temp_files = 0
+            temp_bytes = 0
+    except OSError:
+        pass
+
+    disk_free_bytes: Optional[int] = None
+    try:
+        target = TEMP_DIR if TEMP_DIR.exists() else PROJECT_ROOT
+        disk_free_bytes = shutil.disk_usage(target).free
+    except OSError:
+        pass
+
+    return {
+        "yt_dlp_version": yt_dlp_version,
+        "browser_available": browser_ok,
+        "playwright_version": playwright_version,
+        "ffmpeg_available": ffmpeg_ok,
+        "temp_files": temp_files,
+        "temp_bytes": temp_bytes,
+        "disk_free_bytes": disk_free_bytes,
+    }

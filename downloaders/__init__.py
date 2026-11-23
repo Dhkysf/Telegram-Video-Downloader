@@ -18,6 +18,7 @@ from .common import (
     is_blocked_host,
     new_job_id,
     prepare_temp_dir,
+    runtime_info,
 )
 from .probe import probe_with_browser, should_try_browser
 from .tiktok import scrape_tiktok
@@ -61,6 +62,7 @@ __all__ = [
     "prepare_temp_dir",
     "probe_with_browser",
     "probe_ytdlp",
+    "runtime_info",
     "scrape_tiktok",
     "should_try_browser",
 ]

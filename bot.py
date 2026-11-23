@@ -27,6 +27,7 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 from uuid import uuid4
 
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -34,6 +35,7 @@ from telegram import (
     MessageEntity,
     ReplyParameters,
     Update,
+    __version__ as PTB_VERSION,
 )
 from telegram.constants import ParseMode
 from telegram.error import (
@@ -81,6 +83,7 @@ from downloaders import (
     prepare_temp_dir,
     probe_with_browser,
     probe_ytdlp,
+    runtime_info,
     should_try_browser,
 )
 
@@ -154,8 +157,10 @@ WELCOME_TEXT = (
     "💡 Link boleh diselipkan di dalam kalimat.\n"
     "✅ Sebelum mengunduh, aku tunjukkan dulu videonya supaya kamu bisa memastikan "
     "itu video yang benar (bukan iklan).\n"
-    "🎵 Mau suaranya saja? Tekan tombol <b>Audio saja</b> di pratinjau."
+    "🎵 Mau suaranya saja? Tekan tombol <b>Audio saja</b> di pratinjau.\n"
+    "🩺 Perintah: /ping (cek aktif) · /health (status bot)."
 )
+PING_TEXT = "🏓 Pong! Bot aktif. Uptime: {uptime}"
 INVALID_LINK_TEXT = (
     "🤔 Aku tidak menemukan link yang bisa diproses.\n"
     "Kirim link video yang diawali http:// atau https:// ya."
@@ -243,6 +248,9 @@ class BotState:
     pending: dict[str, PendingChoice] = field(default_factory=dict)
     probe_cache: dict[ProbeCacheKey, tuple[float, ProbeResult]] = field(default_factory=dict)
     in_flight_probes: dict[ProbeCacheKey, asyncio.Future[ProbeResult]] = field(default_factory=dict)
+    started_at: float = field(default_factory=time.monotonic)
+    jobs_ok: int = 0
+    jobs_failed: int = 0
 
 
 # =============================================================================
@@ -728,6 +736,10 @@ async def process_download(
             logger.debug("Could not report upload failure for job %s", job_id)
     finally:
         cancel_event.set()
+        if outcome is ErrorCode.OK:
+            state.jobs_ok += 1
+        else:
+            state.jobs_failed += 1
         removed = await asyncio.to_thread(cleanup_job, job_id)
         logger.info(
             "Job %s finished: user=%s platform=%s outcome=%s size=%.2fMB duration=%.1fs cleaned=%d",
@@ -1106,6 +1118,86 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await safe_reply(message, WELCOME_TEXT, parse_mode=ParseMode.HTML)
 
 
+def format_uptime(seconds: float) -> str:
+    """Return compact Indonesian uptime (e.g. '3j 12m' or '45d')."""
+    total = max(0, int(seconds))
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}h {hours}j {minutes}m"
+    if hours:
+        return f"{hours}j {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}d"
+    return f"{secs}d"
+
+
+def build_health_text(state: BotState, info: dict[str, Any]) -> str:
+    """Build the HTML /health status message from state and runtime_info()."""
+    esc = lambda v: html.escape(str(v))
+    uptime = format_uptime(time.monotonic() - state.started_at)
+    max_slots = state.settings.max_concurrent_downloads
+    sem_val = getattr(state.semaphore, "_value", None)
+    in_use = max(0, max_slots - sem_val) if isinstance(sem_val, int) else "?"
+
+    ffmpeg_val = info.get("ffmpeg_available")
+    ffmpeg_str = "ya" if ffmpeg_val is True else ("tidak" if ffmpeg_val is False else "?")
+
+    browser_ok = bool(info.get("browser_available"))
+    if not state.settings.browser_fallback:
+        browser_str = "nonaktif"
+    elif browser_ok:
+        browser_str = "aktif"
+    else:
+        browser_str = "tidak terpasang"
+
+    confirm_str = "aktif" if state.settings.confirm_before_download else "nonaktif"
+    pw_ver = info.get("playwright_version") if browser_ok else None
+    pw_str = pw_ver or "tidak terpasang"
+
+    temp_files = info.get("temp_files")
+    temp_bytes = info.get("temp_bytes")
+    if isinstance(temp_files, int) and isinstance(temp_bytes, int):
+        temp_str = f"{temp_files} file ({temp_bytes / (1024 * 1024):.1f} MB)"
+    else:
+        temp_str = "?"
+
+    disk_free = info.get("disk_free_bytes")
+    disk_str = f"{disk_free / (1024 ** 3):.1f} GB" if isinstance(disk_free, int) else "?"
+
+    return "\n".join([
+        "🩺 <b>Status Bot</b>",
+        f"⏱ Uptime: <code>{esc(uptime)}</code>",
+        f"📊 Unduhan (sejak mulai): <b>{state.jobs_ok}</b> sukses / <b>{state.jobs_failed}</b> gagal",
+        f"⚙️ Aktif: <b>{len(state.active_users)}</b> job · slot unduh: <b>{esc(in_use)}/{max_slots}</b>",
+        f"🗂 Menunggu konfirmasi: <b>{len(state.pending)}</b> · cache info: <b>{len(state.probe_cache)}</b>",
+        f"🔧 FFmpeg: <b>{esc(ffmpeg_str)}</b> · Browser: <b>{esc(browser_str)}</b> · Konfirmasi: <b>{esc(confirm_str)}</b>",
+        f"📦 Versi: PTB <code>{esc(PTB_VERSION)}</code> · yt-dlp <code>{esc(info.get('yt_dlp_version') or '?')}</code> · Playwright <code>{esc(pw_str)}</code>",
+        f"💾 Folder sementara: <code>{esc(temp_str)}</code> · sisa disk: <code>{esc(disk_str)}</code>",
+    ])
+
+
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /ping: instant liveness reply without blocking."""
+    message = update.effective_message
+    state = get_state(context)
+    if message is None or not is_allowed(update, state):
+        return
+    uptime = format_uptime(time.monotonic() - state.started_at)
+    await safe_reply(message, PING_TEXT.format(uptime=uptime))
+
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /health: report bot health without waiting on download/browser slots."""
+    message = update.effective_message
+    state = get_state(context)
+    if message is None or not is_allowed(update, state):
+        return
+    info = await asyncio.to_thread(runtime_info)
+    await safe_reply(message, build_health_text(state, info), parse_mode=ParseMode.HTML)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle any text message: find a link, check it, ask for confirmation."""
     message = update.message
@@ -1242,7 +1334,17 @@ def build_application(token: str, settings: Settings) -> Application:
         application.bot_data["state"] = BotState(
             settings=settings,
             semaphore=asyncio.Semaphore(settings.max_concurrent_downloads),
+            started_at=time.monotonic(),
         )
+        try:
+            await application.bot.set_my_commands([
+                BotCommand("start", "Mulai & panduan singkat"),
+                BotCommand("help", "Panduan singkat"),
+                BotCommand("ping", "Cek bot aktif"),
+                BotCommand("health", "Status & kesehatan bot"),
+            ])
+        except Exception as exc:
+            logger.warning("Could not register bot commands: %s", exc)
         logger.info("Bot @%s is running (long polling)", application.bot.username)
 
     async def post_shutdown(_application: Application) -> None:
@@ -1258,6 +1360,8 @@ def build_application(token: str, settings: Settings) -> Application:
         .build()
     )
     application.add_handler(CommandHandler(["start", "help"], start_command))
+    application.add_handler(CommandHandler(["ping"], ping_command))
+    application.add_handler(CommandHandler(["health"], health_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^(dl|au|br|cx):"))
     application.add_error_handler(error_handler)
