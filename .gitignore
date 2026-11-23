@@ -2,7 +2,7 @@
 config.py
 .env
 instagram_cookies.txt
-AGENTS.md
+.codegraph/
 
 # Runtime files
 temp_downloads/
@@ -14,3 +14,4 @@ __pycache__/
 venv/
 bot.log*
 bot.console*.log
+bot.update.log
