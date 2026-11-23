@@ -183,6 +183,9 @@ async def check_link(
     try:
         first_text = BROWSER_FORCED_TEXT if force_browser else CHECKING_TEXT.format(site=site)
         cached = _cache_get(state, key)
+        if cached is None:
+            status = await tg_call(lambda: message.reply_text(first_text), "status")
+            cached = _cache_get(state, key)
         if cached is not None:
             probe = cached
             logger.info(
@@ -192,21 +195,22 @@ async def check_link(
         else:
             inflight = state.in_flight_probes.get(key)
             if inflight is not None:
-                status = await tg_call(lambda: message.reply_text(first_text), "status")
                 probe = await asyncio.shield(inflight)
             else:
                 future: asyncio.Future[ProbeResult] = asyncio.get_running_loop().create_future()
                 state.in_flight_probes[key] = future
                 probe_result: Optional[ProbeResult] = None
                 try:
-                    status = await tg_call(lambda: message.reply_text(first_text), "status")
                     probe_result = await probe_link(url, platform, state, status, force_browser)
                     _cache_put(state, key, probe_result)
                 finally:
-                    state.in_flight_probes.pop(key, None)
+                    if state.in_flight_probes.get(key) is future:
+                        state.in_flight_probes.pop(key, None)
                     if not future.done():
                         future.set_result(
-                            probe_result if probe_result is not None else ProbeResult(ErrorCode.UNKNOWN, detail="probe aborted")
+                            probe_result
+                            if probe_result is not None
+                            else ProbeResult(ErrorCode.UNKNOWN, detail="probe aborted")
                         )
                 probe = probe_result
             logger.info(
