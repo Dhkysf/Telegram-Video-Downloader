@@ -754,6 +754,80 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(res.error, ErrorCode.UNSUPPORTED)
 
+    def test_instance_lock_and_main_exit_codes(self) -> None:
+        import os
+        import subprocess
+        from contextlib import contextmanager
+        from telegram.error import InvalidToken
+        import bot as bot_mod
+
+        lock_path = TEMP_DIR / "test_bot.lock"
+        try:
+            with tgbot.settings.instance_lock(lock_path) as ok1:
+                self.assertTrue(ok1)
+                with tgbot.settings.instance_lock(lock_path) as ok2:
+                    self.assertFalse(ok2)
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import sys\nfrom pathlib import Path\n"
+                            "from tgbot.settings import instance_lock\n"
+                            "with instance_lock(Path(sys.argv[1])) as ok: print(ok)"
+                        ),
+                        str(lock_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(PROJECT_ROOT),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), "False")
+            self.assertEqual(lock_path.read_text(encoding="ascii").strip(), str(os.getpid()))
+
+            with tgbot.settings.instance_lock(lock_path) as ok3:
+                self.assertTrue(ok3)
+        finally:
+            lock_path.unlink(missing_ok=True)
+
+        @contextmanager
+        def fake_lock(acquired: bool):
+            yield acquired
+
+        class DummyApp:
+            def __init__(self, exc: Exception) -> None:
+                self._exc = exc
+
+            def run_polling(self, **_kw: object) -> None:
+                raise self._exc
+
+        with (
+            patch.object(bot_mod, "configure_logging"),
+            patch.object(bot_mod, "instance_lock", return_value=fake_lock(False)),
+            patch.object(bot_mod, "prepare_temp_dir") as prep_mock,
+        ):
+            with self.assertRaises(SystemExit) as cm1:
+                bot_mod.main()
+            self.assertEqual(cm1.exception.code, 1)
+            prep_mock.assert_not_called()
+
+        for exc, expected_code in ((InvalidToken("bad"), 1), (NetworkError("offline"), 2)):
+            with (
+                patch.object(bot_mod, "configure_logging"),
+                patch.object(bot_mod, "instance_lock", return_value=fake_lock(True)),
+                patch.object(bot_mod, "load_token", return_value="123:FAKE"),
+                patch.object(bot_mod, "redact_token_in_logs"),
+                patch.object(bot_mod, "configure_ffmpeg"),
+                patch.object(bot_mod, "install_network_guard"),
+                patch.object(bot_mod, "prepare_temp_dir", return_value=0),
+                patch.object(bot_mod, "load_settings", return_value=make_state().settings),
+                patch.object(bot_mod, "build_application", return_value=DummyApp(exc)),
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    bot_mod.main()
+                self.assertEqual(cm.exception.code, expected_code)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

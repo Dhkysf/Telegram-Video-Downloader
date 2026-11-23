@@ -7,10 +7,11 @@ import logging
 import os
 import shutil
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO, Iterator, Optional
 
 from downloaders import PROJECT_ROOT, browser_available
 
@@ -25,6 +26,7 @@ FALSE_VALUES = frozenset({"0", "false", "no", "off", "tidak"})
 
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOG_FILE: Path = PROJECT_ROOT / "bot.log"
+LOCK_FILE: Path = PROJECT_ROOT / "bot.lock"
 LOG_MAX_BYTES = 1024 * 1024  # Rotate at 1 MB...
 LOG_BACKUP_COUNT = 5  # ...keeping bot.log.1 .. bot.log.5 (max ~6 MB total).
 
@@ -84,6 +86,65 @@ def redact_token_in_logs(token: str) -> None:
     """Mask the token in all log output (PTB includes it in some error messages)."""
     for handler in logging.getLogger().handlers:
         handler.setFormatter(RedactingFormatter(LOG_FORMAT, token))
+
+
+def _lock_file(handle: BinaryIO) -> None:
+    """Acquire a non-blocking exclusive lock on ``handle``."""
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(handle: BinaryIO) -> None:
+    """Release the lock held on ``handle``."""
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def instance_lock(path: Path = LOCK_FILE) -> Iterator[bool]:
+    """Acquire a single-instance lock file, yielding True if acquired."""
+    try:
+        handle = open(path, "a+b")
+    except OSError as exc:
+        logger.error("Cannot open lock file %s: %s", path.name, exc)
+        yield False
+        return
+    try:
+        _lock_file(handle)
+    except OSError:
+        handle.close()
+        logger.error("Another instance of the bot is already running (%s); exiting", path.name)
+        yield False
+        return
+    try:
+        try:
+            handle.seek(0)
+            handle.truncate(0)
+            handle.write(f"{os.getpid()}\n".encode("ascii"))
+            handle.flush()
+        except OSError:
+            pass
+        yield True
+    finally:
+        try:
+            _unlock_file(handle)
+        except OSError:
+            pass
+        handle.close()
 
 
 def load_token() -> Optional[str]:

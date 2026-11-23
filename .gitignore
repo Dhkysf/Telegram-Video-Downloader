@@ -15,3 +15,4 @@ venv/
 bot.log*
 bot.console*.log
 bot.update.log
+bot.lock

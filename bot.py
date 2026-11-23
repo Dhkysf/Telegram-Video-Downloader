@@ -14,7 +14,7 @@ import sys
 import time
 
 from telegram import BotCommand, Update
-from telegram.error import InvalidToken
+from telegram.error import InvalidToken, NetworkError
 from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from downloaders import clear_temp_dir, install_network_guard, prepare_temp_dir
@@ -23,6 +23,7 @@ from tgbot.settings import (
     Settings,
     configure_ffmpeg,
     configure_logging,
+    instance_lock,
     load_settings,
     load_token,
     redact_token_in_logs,
@@ -77,39 +78,45 @@ def main() -> None:
     """Run the startup lifecycle and start long polling."""
     # 1. Logging.
     configure_logging()
-    # 2. Token.
-    token = load_token()
-    if not token:
-        logger.error(
-            "TELEGRAM_BOT_TOKEN is not set. Export it as an environment variable "
-            "or define TELEGRAM_BOT_TOKEN in config.py next to bot.py."
-        )
-        sys.exit(1)
-    redact_token_in_logs(token)
-    # 3. FFmpeg.
-    configure_ffmpeg()
-    # Downloads may only connect to public internet addresses (protects the LAN).
-    install_network_guard()
-    # 4. Temp directory.
-    try:
-        removed = prepare_temp_dir()
-    except OSError as exc:
-        logger.error("Cannot create temp directory: %s", exc)
-        sys.exit(1)
-    if removed:
-        logger.info("Removed %d leftover temp file(s) from a previous run", removed)
-    # 5. Application + long polling (SIGINT/SIGTERM trigger a graceful stop).
-    application = build_application(token, load_settings())
-    try:
-        application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            stop_signals=(signal.SIGINT, signal.SIGTERM),
-        )
-    except InvalidToken:
-        # PTB's own message contains the token, so it is deliberately not logged.
-        logger.error("Telegram rejected TELEGRAM_BOT_TOKEN; check the token with @BotFather")
-        sys.exit(1)
+    with instance_lock() as acquired:
+        if not acquired:
+            sys.exit(1)
+        # 2. Token.
+        token = load_token()
+        if not token:
+            logger.error(
+                "TELEGRAM_BOT_TOKEN is not set. Export it as an environment variable "
+                "or define TELEGRAM_BOT_TOKEN in config.py next to bot.py."
+            )
+            sys.exit(1)
+        redact_token_in_logs(token)
+        # 3. FFmpeg.
+        configure_ffmpeg()
+        # Downloads may only connect to public internet addresses (protects the LAN).
+        install_network_guard()
+        # 4. Temp directory.
+        try:
+            removed = prepare_temp_dir()
+        except OSError as exc:
+            logger.error("Cannot create temp directory: %s", exc)
+            sys.exit(1)
+        if removed:
+            logger.info("Removed %d leftover temp file(s) from a previous run", removed)
+        # 5. Application + long polling (SIGINT/SIGTERM trigger a graceful stop).
+        application = build_application(token, load_settings())
+        try:
+            application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+                stop_signals=(signal.SIGINT, signal.SIGTERM),
+            )
+        except InvalidToken:
+            # PTB's own message contains the token, so it is deliberately not logged.
+            logger.error("Telegram rejected TELEGRAM_BOT_TOKEN; check the token with @BotFather")
+            sys.exit(1)
+        except NetworkError as exc:
+            logger.warning("Telegram connection failed during startup: %s", exc)
+            sys.exit(2)
 
 
 if __name__ == "__main__":
