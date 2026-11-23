@@ -98,9 +98,9 @@ Expected result: The bot starts polling Telegram and writes logs to `bot.log` (a
 
 ### What `start_bot.bat` does
 
-1. Runs `.venv\Scripts\python.exe -m pip install -U --disable-pip-version-check yt-dlp` once at startup (logging to `bot.update.log`). If the update fails, it continues with the installed version.
-2. Starts `.venv\Scripts\python.exe bot.py` in a loop, redirecting console output to `bot.console.log` (keeping the previous run in `bot.console.prev.log`).
-3. If `bot.py` exits, it waits 10 seconds and restarts it automatically.
+1. Runs `.venv\Scripts\python.exe -m pip install -U --timeout 30 --disable-pip-version-check yt-dlp` once at startup (logging to `bot.update.log`). If the update fails or times out, it continues with the installed version.
+2. Starts `.venv\Scripts\python.exe bot.py` in a loop, redirecting console output to `bot.console.log` (keeping the previous run in `bot.console.prev.log`). `bot.py` holds a single-instance lock (`bot.lock`) so a second launch exits immediately instead of causing Telegram `Conflict` errors.
+3. If `bot.py` exits with fatal code `1` (missing/invalid token, unwritable temp folder, or another instance already running), `start_bot.bat` stops instead of restarting forever. Otherwise, it waits 10 seconds and restarts automatically.
 
 ### Logs
 
@@ -110,7 +110,7 @@ Expected result: The bot starts polling Telegram and writes logs to `bot.log` (a
 
 ### Stopping the hidden bot
 
-Open **Task Manager** (`Ctrl+Shift+Esc`), find **Windows Command Processor** (`cmd.exe`) running `start_bot.bat`, and end it **before** ending `python.exe` (otherwise `start_bot.bat` will restart `bot.py` after 10 seconds).
+Run `stop_bot.bat` (double-click it in Explorer or run `.\stop_bot.bat` in PowerShell). It terminates the `start_bot.bat` restart loop and the full `bot.py` process tree (including the `.venv` shim and its child `python.exe`).
 
 ## 6. Using the bot
 
