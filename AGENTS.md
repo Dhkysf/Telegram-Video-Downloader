@@ -55,6 +55,7 @@ Platforms and runtime:
 - Single process. No database. In-memory state only, plus temp files.
 - User-facing text could be **Bahasa Indonesia**. Code, comments, logs: English.
 - Always run Python via `.venv\Scripts\python.exe`; do not just use `python` (that command fails in the Antigravity sandbox). For pip: `.venv\Scripts\python.exe -m pip ...`
+- The warning “Failed to find real location of ...pythoncore...python.exe” when running `.venv\Scripts\python.exe` in the sandbox is normal and harmless. Ignore it; do not try to fix it.
 
 ## Architecture invariants (do not break)
 
