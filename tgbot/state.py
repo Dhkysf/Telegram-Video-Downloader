@@ -116,7 +116,11 @@ def _cache_get(state: BotState, key: ProbeCacheKey) -> Optional[ProbeResult]:
 
 def _cache_put(state: BotState, key: ProbeCacheKey, probe: ProbeResult) -> None:
     """Cache a successful ProbeResult, purging expired and oldest entries."""
-    if probe.error is not ErrorCode.OK or not probe.candidates:
+    if (
+        probe.error is not ErrorCode.OK
+        or not probe.candidates
+        or any(c.info_unavailable for c in probe.candidates)
+    ):
         return
     now = time.monotonic()
     for k in [k for k, (created, _) in state.probe_cache.items() if now - created >= PROBE_CACHE_TTL_SECONDS]:
