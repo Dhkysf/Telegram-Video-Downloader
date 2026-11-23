@@ -5,9 +5,10 @@ description: "How to test and verify changes before committing"
 
 ## How to verify changes
 
-There is no test suite in the repo. Before reporting done, run the checks that
-apply, and say plainly which ones you ran and which you could not run (e.g.
-nothing here talks to the real Telegram API without a token).
+`tests/smoke_test.py` provides offline unit and smoke tests (no live Telegram
+API). Before reporting done, run the checks that apply, and say plainly which
+ones you ran and which you could not run (e.g. nothing here talks to the real
+Telegram API without a token).
 
 1. **Compile and lint:** `python -m compileall -q bot.py tgbot downloaders tests` (works
    on Windows shells too). If available, also

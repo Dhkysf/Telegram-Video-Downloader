@@ -17,7 +17,7 @@ description: "Recipes: add a platform, fix yt-dlp breakage, new config option"
   `common.py`, or the `SHORT_AD_*` constants in `streaminfo.py`. Re-run the
   IMA sample page test.
 - **Tune browser timing:** change the constants at the top of `browser.py`.
-  Keep `BROWSER_PROBE_TIMEOUT` in `bot.py` comfortably above
+  Keep `BROWSER_PROBE_TIMEOUT` in `tgbot/flows.py` comfortably above
   `MAX_CAPTURE_SECONDS` + analysis budget + slot wait.
 - **New config option:** read it in `load_settings()` with a safe default,
   add it to `Settings`, log it (never secrets), and document it in this file.

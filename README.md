@@ -8,7 +8,7 @@ A personal Telegram bot for downloading videos on a Windows PC using `python-tel
 
 - **Multi-site support via `yt-dlp`**: TikTok (with an `ssstik.io` scraper fallback), Instagram, X/Twitter, YouTube, SoundCloud, and other public HTTP/HTTPS links.
 - **Preview and confirmation buttons**: Inspects title, duration, quality, estimated size, and thumbnail before downloading anything.
-- **"Audio saja" option**: Download audio-only MP3 from supported links (and audio-only sites like SoundCloud are sent as audio).
+- **"Audio saja" option**: Download audio-only M4A (or MP3 if already MP3) from supported links (and audio-only sites like SoundCloud are sent as audio).
 - **Headless-browser fallback**: Uses Microsoft Edge via Playwright when `yt-dlp` finds nothing on a generic site, capturing video streams and flagging likely ads.
 - **5-minute probe cache**: Reuses recent probe results for 5 minutes (`PROBE_CACHE_TTL_SECONDS = 300`) to avoid re-probing the same link.
 - **`/ping` and `/health` commands**: Quick liveness check and full runtime status report.
@@ -117,7 +117,7 @@ Run `stop_bot.bat` (double-click it in Explorer or run `.\stop_bot.bat` in Power
 1. Send any supported video link to the bot.
 2. The bot probes the link and replies with a preview (thumbnail or browser screenshot) and inline buttons:
    - **Ya, unduh** (or numbered stream buttons when multiple streams are found)
-   - **Audio saja** (download audio as MP3)
+   - **Audio saja** (download audio as M4A, or MP3 if already MP3)
    - **cari pakai browser** (retry with the headless browser if `yt-dlp` picked the wrong thing)
    - **Batal** (cancel)
 3. **⚠️ `kemungkinan iklan`**: Flagged on browser-captured streams whose URL, duration, or metadata matches ad heuristics. Avoid picking these unless you know it is the actual video.
@@ -172,6 +172,7 @@ tgbot/                  Telegram bot package (handlers, flows, preview, state, s
 downloaders/            Media probing & downloading (ytdlp, tiktok, probe, browser, streaminfo, guardproxy, common)
 tests/smoke_test.py     Offline smoke tests
 start_bot.bat           Windows restart loop + yt-dlp auto-update
+stop_bot.bat            Stops the start_bot.bat loop and bot.py process tree
 start_bot_hidden.vbs    Hidden launcher for start_bot.bat
 requirements.txt        Python dependencies
 ```

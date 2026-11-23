@@ -49,7 +49,8 @@ Platforms and runtime:
 - Audio-only results (e.g. SoundCloud) are sent with `send_audio`.
 - The bot runs on the owner's **Windows home PC**, started hidden at logon by
   `start_bot_hidden.vbs`, which runs `start_bot.bat`. That script restarts the
-  bot in a loop and logs to `bot.log`.
+  bot in a loop and logs console/update output to `bot.console.log` / `bot.update.log`
+  (`bot.py` writes rotating application logs to `bot.log`).
 - The browser uses the built-in **Microsoft Edge** (`channel="msedge"`),
   headless, with no visible window.
 - Single process. No database. In-memory state only, plus temp files.
@@ -77,7 +78,7 @@ Platforms and runtime:
    - Downloaders `fn(url, job_id, cancel_event) -> DownloadResult` and probes
      (`probe_ytdlp`, `probe_with_browser`) `-> ProbeResult` always return an
      explicit result. `detail` is for logs only.
-   - They are only called through `run_worker()` in `bot.py`
+   - They are only called through `run_worker()` in `tgbot/workers.py`
      (`asyncio.to_thread` inside `asyncio.wait_for(asyncio.shield(...))`).
    - Never call yt-dlp, `requests`, or Playwright on the event loop.
 6. **Cooperative cancellation.** `to_thread` cannot be killed. Long loops,

@@ -4,7 +4,7 @@ globs: "bot.py, tgbot/*.py"
 description: "Probe/confirmation flow and Telegram API rules for bot.py and tgbot"
 ---
 
-## Probe and confirmation flow (bot.py)
+## Probe and confirmation flow (tgbot/)
 
 - `handle_text`:
   1. `extract_first_url` + `detect_platform`.
@@ -41,7 +41,7 @@ description: "Probe/confirmation flow and Telegram API rules for bot.py and tgbo
     rejects the thumbnail (`BadRequest`), fall back to a text message.
   - Escape every dynamic value with `html.escape`, and use `parse_mode=HTML`.
 - **Buttons:**
-  - `callback_data` is `dl:<token>:<index>`, `br:<token>`, or `cx:<token>`.
+  - `callback_data` is `dl:<token>:<index>`, `au:<token>:<index>`, `br:<token>`, or `cx:<token>`.
     It must stay under 64 bytes.
   - `PendingChoice` entries live in `state.pending`. They are one-shot and
     owner-only (compare `update.effective_user.id`), expire after
@@ -55,7 +55,7 @@ description: "Probe/confirmation flow and Telegram API rules for bot.py and tgbo
   yt-dlp candidates, or `download_browser_stream(candidate, probe, ...)` for
   browser candidates.
 
-## Telegram rules (bot.py)
+## Telegram rules (tgbot/)
 
 - `concurrent_updates(True)` is on. Every check-and-set on `state` (cooldown,
   active users, pending) must stay free of `await` between check and set.
@@ -72,8 +72,9 @@ description: "Probe/confirmation flow and Telegram API rules for bot.py and tgbo
 - **BadRequest on edit/delete** of status or preview messages is ignored with
   a DEBUG log. `Forbidden` (user blocked the bot) is logged at INFO and the
   flow stops.
-- **Error handler** logs with `exc_info=context.error` and sends a generic
-  apology.
+- **Error handler** logs `NetworkError`/`TimedOut` (other than `BadRequest`) as a
+  1-line `WARNING`, logs other errors with `exc_info=context.error`, and sends a
+  generic apology.
 - **User-facing strings** live in the `*_TEXT`/`*_NOTE`/`*_QUESTION`
   constants and `ERROR_MESSAGES`: Indonesian, friendly, no paths, tokens, or
   raw errors. New `ErrorCode` values need an `ERROR_MESSAGES` entry.
