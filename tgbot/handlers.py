@@ -13,7 +13,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TelegramError
 from telegram.ext import ContextTypes
 
-from downloaders import MediaCandidate, runtime_info
+from downloaders import MediaCandidate, browser_available, runtime_info
 from tgbot.flows import check_link, process_download
 from tgbot.links import detect_platform, extract_first_url
 from tgbot.preview import finish_preview
@@ -192,25 +192,37 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if action not in ("dl", "au", "br"):
         await _answer(query, "")
         return
+    if action == "br" and not (
+        state.settings.browser_fallback and pending.probe.can_try_browser and browser_available()
+    ):
+        await _answer(query, EXPIRED_TEXT, alert=True)
+        return
 
     # Same check-and-set as for new links: no await between check and set.
     if user.id in state.active_users:
         await _answer(query, ACTIVE_JOB_TEXT, alert=True)
         return
     candidate: Optional[MediaCandidate] = None
+    idx: Optional[int] = None
     audio = action == "au"
     if action in ("dl", "au"):
         try:
-            candidate = pending.probe.candidates[int(parts[2])]
-        except (IndexError, ValueError):
+            if len(parts) != 3:
+                raise ValueError("missing index")
+            idx = int(parts[2])
+        except ValueError:
             await _answer(query, EXPIRED_TEXT, alert=True)
             return
+        if not (0 <= idx < len(pending.probe.candidates)):
+            await _answer(query, EXPIRED_TEXT, alert=True)
+            return
+        candidate = pending.probe.candidates[idx]
     state.pending.pop(token, None)
     state.active_users.add(user.id)
     try:
         await _answer(query, "")
-        if candidate is not None:
-            label = f"video #{int(parts[2]) + 1}" if pending.probe.via_browser else "video ini"
+        if candidate is not None and idx is not None:
+            label = f"video #{idx + 1}" if pending.probe.via_browser else "video ini"
             if audio:
                 label = f"audio dari {label}"
             await finish_preview(pending, CHOSEN_NOTE.format(label=label))

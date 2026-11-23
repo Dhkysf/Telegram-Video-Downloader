@@ -17,8 +17,16 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 import yt_dlp
+from yt_dlp.downloader.external import ExternalFD, FFmpegFD
+from yt_dlp.downloader.rtmp import RtmpFD
 from yt_dlp.extractor import gen_extractor_classes
-from yt_dlp.utils import DownloadCancelled, DownloadError, ExtractorError
+from yt_dlp.utils import (
+    DownloadCancelled,
+    DownloadError,
+    ExtractorError,
+    UnavailableVideoError,
+    determine_protocol,
+)
 
 from .common import (
     DEFAULT_MAX_HEIGHT,
@@ -27,12 +35,14 @@ from .common import (
     MAX_SOURCE_ATTEMPTS,
     TEMP_DIR,
     BLOCKED_ADDRESS_MESSAGE,
+    BlockedAddressError,
     DownloadResult,
     ErrorCode,
     MediaCandidate,
     ProbeResult,
     backoff_delay,
     cleanup_job,
+    is_network_guard_active,
     new_job_id,
     public_network_only,
     write_cookie_file,
@@ -90,6 +100,56 @@ BROWSER_COOKIE_SUFFIX: str = ".browser-cookies.txt"
 TIKTOK_SCRAPER_RETRY_CODES: frozenset[ErrorCode] = frozenset(
     {ErrorCode.UNKNOWN, ErrorCode.NOT_FOUND, ErrorCode.NETWORK, ErrorCode.UNSUPPORTED}
 )
+ALLOWED_PROTOCOLS: frozenset[str] = frozenset({
+    "http",
+    "https",
+    "m3u8",
+    "m3u8_native",
+    "http_dash_segments",
+    "http_dash_segments_generator",
+})
+
+
+def _guard_external_fd(cls: type[Any]) -> None:
+    """Wrap ``cls.real_download`` so it raises BlockedAddressError under public_network_only()."""
+    orig = cls.real_download
+    if getattr(orig, "_network_guarded", False):
+        return
+
+    def _guarded(self: Any, filename: str, info_dict: dict[str, Any]) -> Any:
+        if is_network_guard_active():
+            raise BlockedAddressError(BLOCKED_ADDRESS_MESSAGE)
+        return orig(self, filename, info_dict)
+
+    _guarded._network_guarded = True  # type: ignore[attr-defined]
+    cls.real_download = _guarded  # type: ignore[method-assign]
+
+
+def install_ytdlp_guard() -> None:
+    """Block yt-dlp external network downloaders inside public_network_only().
+
+    Idempotent. Only blocks network downloaders (ExternalFD/FFmpegFD/RtmpFD);
+    FFmpeg postprocessors operate on local files and remain unaffected.
+    """
+    _guard_external_fd(ExternalFD)
+    _guard_external_fd(FFmpegFD)
+    _guard_external_fd(RtmpFD)
+
+
+def _match_filter(info: dict[str, Any], *, incomplete: bool = False) -> Optional[str]:
+    """Reject live streams and non-HTTP/HLS/DASH protocols before downloading."""
+    if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
+        return "live stream"
+    if incomplete:
+        return None
+    for fmt in info.get("requested_formats") or [info]:
+        if fmt.get("is_live"):
+            return "live stream"
+        raw_proto = fmt.get("protocol") or (determine_protocol(fmt) if fmt.get("url") else "")
+        parts = [p.strip().lower() for p in str(raw_proto).split("+") if p.strip()]
+        if not parts or any(p not in ALLOWED_PROTOCOLS for p in parts):
+            return f"unsupported protocol: {raw_proto or 'unknown'}"
+    return None
 
 
 class _TooLargeDuringDownload(DownloadCancelled):
@@ -116,6 +176,7 @@ class _YtdlpLogger:
         """Initialise the logger state."""
         self.max_filesize_hit: bool = False
         self.last_error: str = ""
+        self.rejected_reason: str = ""
 
     def _inspect(self, msg: str) -> None:
         if MAX_FILESIZE_MARKER in msg:
@@ -294,6 +355,12 @@ def _build_options(
         if downloaded > MAX_FILE_SIZE_BYTES or expected > MAX_FILE_SIZE_BYTES:
             raise _TooLargeDuringDownload("download exceeded the size limit")
 
+    def _filter(info: dict[str, Any], *, incomplete: bool = False) -> Optional[str]:
+        reason = _match_filter(info, incomplete=incomplete)
+        if reason is not None:
+            ydl_logger.rejected_reason = reason
+        return reason
+
     if audio_only:
         format_selector = build_audio_format_selector(can_merge, last_resort)
     else:
@@ -306,6 +373,9 @@ def _build_options(
         "noplaylist": True,
         "playlist_items": "1",  # Multi-video posts: only the first video.
         "max_filesize": MAX_FILE_SIZE_BYTES,
+        "hls_prefer_native": True,
+        "external_downloader": {"default": "native"},
+        "match_filter": _filter,
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -424,13 +494,15 @@ def _single_attempt(
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
+    except BlockedAddressError:
+        return _Attempt(DownloadResult(None, ErrorCode.UNSUPPORTED, BLOCKED_ADDRESS_MESSAGE))
     except _TooLargeDuringDownload:
         return _Attempt(
             DownloadResult(None, ErrorCode.TOO_LARGE, "aborted at size limit"), try_lower=True
         )
     except DownloadCancelled:
         return _Attempt(DownloadResult(None, ErrorCode.TIMEOUT, "cancelled by job timeout"))
-    except (DownloadError, ExtractorError) as exc:
+    except (DownloadError, ExtractorError, UnavailableVideoError) as exc:
         message = str(exc)
         if FORMAT_UNAVAILABLE_PATTERN.search(message) and not last_resort:
             return _Attempt(
@@ -460,7 +532,10 @@ def _single_attempt(
                 audio_only=extracted_audio or _is_audio_only(info, path),
             )
         )
-    # No file produced: yt-dlp silently skips downloads that exceed max_filesize.
+    # No file produced: check match_filter rejection before max_filesize.
+    if ydl_logger.rejected_reason:
+        code = ErrorCode.LIVE if "live" in ydl_logger.rejected_reason else ErrorCode.UNSUPPORTED
+        return _Attempt(DownloadResult(None, code, ydl_logger.rejected_reason))
     if ydl_logger.max_filesize_hit or _estimated_size(info) > MAX_FILE_SIZE_BYTES:
         return _Attempt(
             DownloadResult(None, ErrorCode.TOO_LARGE, "skipped by max_filesize"), try_lower=True
@@ -529,6 +604,7 @@ def download_with_ytdlp(
     """
     if audio_only:
         max_height = min(max_height, AUDIO_MODE_MAX_HEIGHT)
+    install_ytdlp_guard()
     try:
         with public_network_only():
             return _download_capped(
@@ -674,13 +750,16 @@ def _probe_once(
         cookiefile = _prepare_cookiefile(probe_id)
         if cookiefile is not None:
             extra["cookiefile"] = str(cookiefile)
-    options = _build_options(probe_id, DEFAULT_MAX_HEIGHT, True, _YtdlpLogger(), cancel_event, extra)
+    ydl_logger = _YtdlpLogger()
+    options = _build_options(probe_id, DEFAULT_MAX_HEIGHT, True, ydl_logger, cancel_event, extra)
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
+    except BlockedAddressError:
+        return ProbeResult(ErrorCode.UNSUPPORTED, detail=BLOCKED_ADDRESS_MESSAGE), False
     except DownloadCancelled:
         return ProbeResult(ErrorCode.TIMEOUT, detail="cancelled"), False
-    except (DownloadError, ExtractorError) as exc:
+    except (DownloadError, ExtractorError, UnavailableVideoError) as exc:
         message = str(exc)
         code = classify_error(message)
         retryable = code is ErrorCode.RATE_LIMITED or bool(SERVER_ERROR_PATTERN.search(message))
@@ -689,6 +768,9 @@ def _probe_once(
         logger.warning("Unexpected yt-dlp probe failure for %s", probe_id, exc_info=True)
         return ProbeResult(ErrorCode.UNKNOWN, detail=f"{type(exc).__name__}: {exc}"[:500]), False
 
+    if ydl_logger.rejected_reason:
+        code = ErrorCode.LIVE if "live" in ydl_logger.rejected_reason else ErrorCode.UNSUPPORTED
+        return ProbeResult(code, detail=ydl_logger.rejected_reason), False
     if not info or (info.get("_type") == "playlist" and not any(info.get("entries") or [])):
         return ProbeResult(ErrorCode.NOT_FOUND, detail="yt-dlp found no video"), False
     entry = _first_entry(info)
@@ -715,6 +797,7 @@ def probe_ytdlp(url: str, platform: str, cancel_event: Optional[threading.Event]
     """
     probe_id = new_job_id(f"probe-{platform}")
     result = ProbeResult(ErrorCode.UNKNOWN, detail="not started")
+    install_ytdlp_guard()
     try:
         with public_network_only():
             for attempt in range(1, MAX_SOURCE_ATTEMPTS + 1):

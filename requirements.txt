@@ -12,6 +12,9 @@ yt-dlp>=2026.10.26
 
 requests~=2.32
 
+# Native AES-128 HLS decryption in yt-dlp without delegating to external ffmpeg.
+pycryptodomex~=3.20
+
 # Headless browser fallback (optional: the bot works without it).
 # On Windows it uses the built-in Microsoft Edge, nothing else to install.
 # Without Edge/Chrome, run once: python -m playwright install chromium

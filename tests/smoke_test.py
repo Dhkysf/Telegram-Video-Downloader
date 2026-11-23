@@ -331,6 +331,7 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
             patch.object(tgbot.flows, "probe_with_browser", return_value=br_probe),
             patch.object(tgbot.workers, "download_browser_stream", fake_br_dl),
             patch.object(tgbot.preview, "browser_available", return_value=True),
+            patch.object(tgbot.handlers, "browser_available", return_value=True),
         ):
             msg = make_message("https://example.com/watch", user_id=100)
             await tgbot.handlers.handle_text(Update(1, message=msg), ctx)
@@ -606,6 +607,152 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bot2.videos), 1)
         self.assertEqual(state2.jobs_ok, 1)
         self.assertEqual(state2.jobs_failed, 0)
+
+    def test_ytdlp_external_fd_guard_and_match_filter(self) -> None:
+        import io
+        import yt_dlp
+        from yt_dlp.dependencies import Cryptodome
+        from yt_dlp.downloader import get_suitable_downloader
+        from yt_dlp.downloader.external import FFmpegFD
+        from yt_dlp.downloader.hls import HlsFD
+        from yt_dlp.downloader.rtmp import RtmpFD
+
+        from downloaders.common import BlockedAddressError, install_network_guard, public_network_only
+        from downloaders.ytdlp import _YtdlpLogger, _build_options, _match_filter
+
+        install_network_guard()
+        opts = _build_options("testjob", 720, False, _YtdlpLogger(), None, None)
+        self.assertTrue(opts["hls_prefer_native"])
+        self.assertEqual(opts["external_downloader"], {"default": "native"})
+        self.assertIsNotNone(Cryptodome.AES)
+
+        self.assertIs(get_suitable_downloader({"url": "https://example.com/v.m3u8", "protocol": "m3u8"}, opts), HlsFD)
+        self.assertIsNone(_match_filter({"url": "https://example.com/v.mp4", "protocol": "https"}))
+        self.assertIsNone(_match_filter({"url": "https://example.com/v.m3u8", "protocol": "m3u8"}))
+        self.assertIsNone(_match_filter({"url": "https://example.com/v", "protocol": "https+http_dash_segments"}))
+        self.assertIsNone(_match_filter({"is_live": False}, incomplete=True))
+        self.assertIn("live", _match_filter({"is_live": True}, incomplete=True) or "")
+        self.assertIn("live", _match_filter({"live_status": "is_upcoming"}, incomplete=True) or "")
+        self.assertIn("unsupported protocol", _match_filter({"url": "rtmp://example.com/live", "protocol": "rtmp"}) or "")
+        self.assertIn("unsupported protocol", _match_filter({"url": "mms://example.com/v", "protocol": "mms"}) or "")
+        self.assertIn("unsupported protocol", _match_filter({"url": "https://example.com/v", "protocol": "https+rtmp"}) or "")
+
+        with public_network_only():
+            with self.assertRaises(BlockedAddressError):
+                FFmpegFD(yt_dlp.YoutubeDL(opts), opts).real_download(str(TEMP_DIR / "x.mp4"), {"url": "https://example.com/v.m3u8"})
+            with self.assertRaises(BlockedAddressError):
+                RtmpFD(yt_dlp.YoutubeDL(opts), opts).real_download(str(TEMP_DIR / "x.flv"), {"url": "rtmp://example.com/v"})
+
+        aes_manifest = (
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n"
+            '#EXT-X-KEY:METHOD=AES-128,URI="https://example.com/key"\n'
+            "#EXTINF:2.0,\nhttps://example.com/seg.ts\n#EXT-X-ENDLIST\n"
+        )
+        self.assertTrue(HlsFD.can_download(aes_manifest, {"url": "https://example.com/v.m3u8"}))
+
+        class FakeUrlH:
+            def __init__(self, url: str, data: bytes) -> None:
+                self.url = url
+                self.headers = {"Content-length": str(len(data))}
+                self._buf = io.BytesIO(data)
+
+            def read(self, amt: int = -1) -> bytes:
+                return self._buf.read(amt)
+
+            def close(self) -> None:
+                self._buf.close()
+
+        key = b"0123456789abcdef"
+        iv = b"\x00" * 16
+        cipher = Cryptodome.AES.new(key, Cryptodome.AES.MODE_CBC, iv)  # type: ignore[union-attr]
+        encrypted_seg = cipher.encrypt(b"TSDATA" + b"\x0a" * 10)
+
+        ydl = yt_dlp.YoutubeDL(opts)
+        with patch.object(ydl, "urlopen", side_effect=lambda req: FakeUrlH(req.url if hasattr(req, "url") else str(req), key if "key" in str(getattr(req, "url", req)) else encrypted_seg)):
+            out_file = TEMP_DIR / "aes_test.mp4"
+            try:
+                with public_network_only(), patch.object(FFmpegFD, "real_download", side_effect=AssertionError("FFmpegFD must not run")):
+                    ok = HlsFD(ydl, opts).real_download(str(out_file), {"url": "https://example.com/v.m3u8", "ext": "mp4", "hls_media_playlist_data": aes_manifest})
+                self.assertTrue(ok)
+                self.assertTrue(out_file.exists())
+            finally:
+                for p in TEMP_DIR.glob("aes_test.mp4*"):
+                    p.unlink(missing_ok=True)
+
+        with patch("yt_dlp.downloader.hls.Cryptodome.AES", None), patch.object(ydl, "urlopen", return_value=FakeUrlH("https://example.com/v.m3u8", aes_manifest.encode())), public_network_only():
+            with self.assertRaises(BlockedAddressError):
+                HlsFD(ydl, opts).real_download(str(TEMP_DIR / "aes_blocked.mp4"), {"url": "https://example.com/v.m3u8", "ext": "mp4"})
+
+    async def test_crafted_callback_br_and_negative_index_rejected(self) -> None:
+        state = make_state(browser_fallback=False)
+        ctx = make_context(state)
+        probe_gen = ProbeResult(
+            ErrorCode.OK,
+            candidates=[
+                MediaCandidate(url="https://example.com/v.mp4", title="Main", duration=10),
+                MediaCandidate(url="https://ads.example.com/ad.mp4", title="Ad", duration=5, likely_ad=True),
+            ],
+            can_try_browser=True,
+        )
+        with patch.object(tgbot.flows, "probe_ytdlp", return_value=probe_gen), patch.object(tgbot.flows, "probe_with_browser") as br_mock:
+            await tgbot.handlers.handle_text(Update(1, message=make_message("https://example.com/watch")), ctx)
+            tok = next(iter(state.pending))
+            q_br = FakeQuery(f"br:{tok}")
+            await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_br, effective_user=User(100, "u", False)), ctx)
+            self.assertEqual(q_br.answers, [(tgbot.texts.EXPIRED_TEXT, True)])
+            self.assertIn(tok, state.pending)
+            br_mock.assert_not_called()
+
+            res = await tgbot.flows.probe_link("https://example.com/watch", "generic", state, None, force_browser=True)
+            self.assertEqual(res.error, ErrorCode.UNSUPPORTED)
+            br_mock.assert_not_called()
+
+            for bad_data in (f"dl:{tok}:-1", f"au:{tok}:-1", f"dl:{tok}:99"):
+                q_bad = FakeQuery(bad_data)
+                await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_bad, effective_user=User(100, "u", False)), ctx)
+                self.assertEqual(q_bad.answers, [(tgbot.texts.EXPIRED_TEXT, True)])
+            self.assertEqual(state.active_users, set())
+
+        state2 = make_state(browser_fallback=True, user_cooldown_seconds=0.0)
+        ctx2 = make_context(state2)
+        probe_yt = ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://youtube.com/watch?v=1", title="YT")], can_try_browser=False)
+        with patch.object(tgbot.flows, "probe_ytdlp", return_value=probe_yt), patch.object(tgbot.flows, "probe_with_browser") as br_mock2:
+            await tgbot.handlers.handle_text(Update(2, message=make_message("https://youtube.com/watch?v=1")), ctx2)
+            tok2 = next(iter(state2.pending))
+            q_br2 = FakeQuery(f"br:{tok2}")
+            await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_br2, effective_user=User(100, "u", False)), ctx2)
+            self.assertEqual(q_br2.answers, [(tgbot.texts.EXPIRED_TEXT, True)])
+            br_mock2.assert_not_called()
+
+    def test_nat64_and_scrape_tiktok_network_guard(self) -> None:
+        import requests
+
+        from downloaders.common import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError, is_blocked_host, is_network_guard_active, is_public_ip
+        from downloaders.tiktok import scrape_tiktok
+
+        for bad_ip in ("64:ff9b::127.0.0.1", "64:ff9b::192.168.1.1", "64:ff9b::8.8.8.8", "64:ff9b:1::1", "64:ff9b:1:abcd::127.0.0.1", "::ffff:127.0.0.1"):
+            self.assertFalse(is_public_ip(bad_ip), f"Expected False for {bad_ip}")
+        for good_ip in ("8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8"):
+            self.assertTrue(is_public_ip(good_ip), f"Expected True for {good_ip}")
+        self.assertTrue(is_blocked_host("[64:ff9b::127.0.0.1]"))
+        self.assertIsNone(tgbot.links.detect_platform("http://[64:ff9b::127.0.0.1]/v"))
+
+        calls = 0
+        guard_seen = False
+
+        def fake_request(_self: object, _method: str, _url: str, **_kw: object) -> object:
+            nonlocal calls, guard_seen
+            calls += 1
+            guard_seen = is_network_guard_active()
+            raise requests.ConnectionError(BlockedAddressError(BLOCKED_ADDRESS_MESSAGE))
+
+        self.assertFalse(is_network_guard_active())
+        with patch.object(requests.Session, "request", fake_request):
+            res = scrape_tiktok("https://www.tiktok.com/@a/video/1", "tiktok_guard_test")
+        self.assertTrue(guard_seen)
+        self.assertFalse(is_network_guard_active())
+        self.assertEqual(calls, 1)
+        self.assertEqual(res.error, ErrorCode.UNSUPPORTED)
 
 
 if __name__ == "__main__":

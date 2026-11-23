@@ -88,6 +88,12 @@ class DownloadResult:
 # Hostnames that always point to the local machine or the local network.
 LOCAL_HOSTNAMES: frozenset[str] = frozenset({"localhost", "localhost.localdomain"})
 LOCAL_HOST_SUFFIXES: tuple[str, ...] = (".localhost", ".local", ".lan", ".internal", ".home.arpa")
+# RFC 6052 / RFC 8215 NAT64 prefixes can embed private/loopback IPv4 inside
+# IPv6 addresses that Python's ipaddress marks as globally routable.
+NAT64_NETWORKS: tuple[ipaddress.IPv6Network, ...] = (
+    ipaddress.IPv6Network("64:ff9b::/96"),
+    ipaddress.IPv6Network("64:ff9b:1::/48"),
+)
 BLOCKED_ADDRESS_MESSAGE: str = "connection to a non-public address was blocked"
 
 _guard_state = threading.local()
@@ -109,8 +115,11 @@ def is_public_ip(value: str) -> bool:
         address = ipaddress.ip_address(value.split("%", 1)[0])
     except ValueError:
         return False
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        address = address.ipv4_mapped
+    if isinstance(address, ipaddress.IPv6Address):
+        if any(address in net for net in NAT64_NETWORKS):
+            return False
+        if address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
     return address.is_global and not address.is_multicast
 
 
@@ -132,9 +141,14 @@ def is_blocked_host(host: str) -> bool:
     return not is_public_ip(host)
 
 
+def is_network_guard_active() -> bool:
+    """Return True if the current thread is inside ``public_network_only()``."""
+    return bool(getattr(_guard_state, "active", False))
+
+
 def _check_destination(sock: socket.socket, address: Any) -> None:
     """Raise BlockedAddressError if a guarded thread connects to a non-public IP."""
-    if not getattr(_guard_state, "active", False):
+    if not is_network_guard_active():
         return
     if sock.family not in (socket.AF_INET, socket.AF_INET6):
         return
@@ -163,6 +177,9 @@ def install_network_guard() -> None:
     """
     socket.socket.connect = _guarded_connect  # type: ignore[method-assign]
     socket.socket.connect_ex = _guarded_connect_ex  # type: ignore[method-assign]
+    from .ytdlp import install_ytdlp_guard
+
+    install_ytdlp_guard()
 
 
 @contextmanager

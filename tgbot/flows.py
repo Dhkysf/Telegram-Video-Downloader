@@ -141,6 +141,8 @@ async def probe_link(
     url: str, platform: str, state: BotState, status: Optional[Message], force_browser: bool
 ) -> ProbeResult:
     """Check a link: yt-dlp first, then (for generic sites) a headless browser."""
+    if force_browser and not state.settings.browser_fallback:
+        return ProbeResult(ErrorCode.UNSUPPORTED, detail="browser fallback disabled")
     timeout_result = ProbeResult(ErrorCode.TIMEOUT, detail="probe timeout")
     error_result = ProbeResult(ErrorCode.UNKNOWN, detail="probe worker raised")
     first: Optional[ProbeResult] = None

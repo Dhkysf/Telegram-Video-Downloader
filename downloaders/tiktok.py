@@ -25,9 +25,11 @@ from .common import (
     MAX_FILE_SIZE_BYTES,
     MAX_SOURCE_ATTEMPTS,
     TEMP_DIR,
+    BLOCKED_ADDRESS_MESSAGE,
     DownloadResult,
     ErrorCode,
     backoff_delay,
+    public_network_only,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,6 +119,8 @@ def _request(
         try:
             response = session.request(method, url, **kwargs)
         except (requests.Timeout, requests.ConnectionError) as exc:
+            if BLOCKED_ADDRESS_MESSAGE in str(exc):
+                raise _ScrapeError(ErrorCode.UNSUPPORTED, BLOCKED_ADDRESS_MESSAGE) from exc
             last_code, last_detail = ErrorCode.NETWORK, f"{type(exc).__name__}"
         except requests.RequestException as exc:
             raise _ScrapeError(ErrorCode.UNKNOWN, f"request failed: {type(exc).__name__}") from exc
@@ -261,7 +265,7 @@ def scrape_tiktok(url: str, job_id: str, cancel_event: Optional[threading.Event]
     final_path = TEMP_DIR / f"{job_id}{OUTPUT_EXTENSION}"
     part_path = TEMP_DIR / f"{job_id}{OUTPUT_EXTENSION}.part"
     try:
-        with requests.Session() as session:
+        with public_network_only(), requests.Session() as session:
             session.headers.update(
                 {"User-Agent": BROWSER_USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
             )
