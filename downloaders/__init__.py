@@ -23,6 +23,7 @@ from .probe import probe_with_browser, should_try_browser
 from .tiktok import scrape_tiktok
 from .ytdlp import (
     describe_site,
+    download_audio,
     download_browser_stream,
     get_generic,
     get_instagram,
@@ -47,6 +48,7 @@ __all__ = [
     "cleanup_job",
     "clear_temp_dir",
     "describe_site",
+    "download_audio",
     "download_browser_stream",
     "get_generic",
     "get_instagram",

@@ -77,6 +77,12 @@ DRM_PATTERN = re.compile(r"\bdrm\b", re.IGNORECASE)
 # Remux only video containers to MP4; audio files (mp3, m4a, opus) stay as they are.
 REMUX_MAPPING: str = "webm>mp4/mkv>mp4/mov>mp4/flv>mp4/avi>mp4/m4v>mp4/3gp>mp4/ts>mp4"
 AUDIO_EXTENSIONS: frozenset[str] = frozenset({"mp3", "m4a", "aac", "opus", "ogg", "oga", "wav", "flac"})
+# Audio-only mode: FFmpegExtractAudio keeps MP3/M4A as they are and turns anything
+# else into M4A (AAC is copied without re-encoding). Telegram plays both inline.
+AUDIO_CODEC_MAPPING: str = "mp3>mp3/m4a>m4a/m4a"
+# Audio-only mode falls back to a muxed file ("b") when a site has no separate
+# audio stream; this cap keeps that download small. Audio formats have no height.
+AUDIO_MODE_MAX_HEIGHT: int = 480
 GENERIC_EXTRACTOR_KEY: str = "Generic"
 MAX_FILESIZE_MARKER: str = "max-filesize"
 BROWSER_COOKIE_SUFFIX: str = ".browser-cookies.txt"
@@ -204,6 +210,29 @@ def build_format_selector(can_merge: bool, last_resort: bool) -> str:
     return "/".join(choices)
 
 
+def build_audio_format_selector(can_extract: bool, last_resort: bool) -> str:
+    """Build the format selector for audio-only downloads ("ba/b").
+
+    ``ba`` is the best audio-only stream. ``b`` (best file with both video and
+    audio) is the fallback for sites without a separate audio stream; FFmpeg
+    then extracts its audio track, so it is only used when FFmpeg exists.
+
+    Args:
+        can_extract: Whether FFmpeg is available to extract audio from video.
+        last_resort: Append a final "worst quality" fallback.
+
+    Returns:
+        A yt-dlp format selection string.
+    """
+    total = _size_filter(MAX_FILE_SIZE_BYTES)
+    choices: list[str] = [f"ba{total}"]
+    if can_extract:
+        choices.append(f"b{total}")
+    if last_resort:
+        choices.append("wa/w" if can_extract else "wa")
+    return "/".join(choices)
+
+
 def build_format_sort(max_height: int) -> list[str]:
     """Return a yt-dlp ``format_sort`` list for a resolution cap.
 
@@ -248,10 +277,12 @@ def _build_options(
     ydl_logger: _YtdlpLogger,
     cancel_event: Optional[threading.Event],
     extra_options: Optional[dict[str, Any]],
+    audio_only: bool = False,
 ) -> dict[str, Any]:
     """Return the yt-dlp option dictionary for one attempt.
 
     ``extra_options`` (cookiefile, http_headers, ...) are merged in last.
+    ``audio_only`` selects audio formats and extracts the audio with FFmpeg.
     """
     can_merge = ffmpeg_available()
 
@@ -263,9 +294,13 @@ def _build_options(
         if downloaded > MAX_FILE_SIZE_BYTES or expected > MAX_FILE_SIZE_BYTES:
             raise _TooLargeDuringDownload("download exceeded the size limit")
 
+    if audio_only:
+        format_selector = build_audio_format_selector(can_merge, last_resort)
+    else:
+        format_selector = build_format_selector(can_merge, last_resort)
     options: dict[str, Any] = {
         "outtmpl": str(TEMP_DIR / f"{job_id}.%(ext)s"),
-        "format": build_format_selector(can_merge, last_resort),
+        "format": format_selector,
         "format_sort": build_format_sort(max_height),
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -280,7 +315,10 @@ def _build_options(
         "logger": ydl_logger,
         "progress_hooks": [_progress_hook],
     }
-    if can_merge:
+    if can_merge and audio_only:
+        # Keep MP3/M4A as they are; extract (or copy AAC) to M4A otherwise.
+        options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": AUDIO_CODEC_MAPPING}]
+    elif can_merge:
         # Remux (no re-encode) to MP4 when the final container is something else.
         options["postprocessors"] = [{"key": "FFmpegVideoRemuxer", "preferedformat": REMUX_MAPPING}]
     if extra_options:
@@ -376,10 +414,13 @@ def _single_attempt(
     last_resort: bool,
     cancel_event: Optional[threading.Event],
     extra_options: Optional[dict[str, Any]],
+    audio_only: bool = False,
 ) -> _Attempt:
     """Run yt-dlp once and classify the outcome."""
     ydl_logger = _YtdlpLogger()
-    options = _build_options(job_id, max_height, last_resort, ydl_logger, cancel_event, extra_options)
+    options = _build_options(
+        job_id, max_height, last_resort, ydl_logger, cancel_event, extra_options, audio_only
+    )
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -408,12 +449,15 @@ def _single_attempt(
 
     path = resolve_output_path(info, job_id)
     if path is not None:
+        # After audio extraction the format info still describes the source
+        # (which may have had video), so the file extension decides.
+        extracted_audio = audio_only and path.suffix.lower().lstrip(".") in AUDIO_EXTENSIONS
         return _Attempt(
             DownloadResult(
                 path,
                 ErrorCode.OK,
                 "yt-dlp",
-                audio_only=_is_audio_only(info, path),
+                audio_only=extracted_audio or _is_audio_only(info, path),
             )
         )
     # No file produced: yt-dlp silently skips downloads that exceed max_filesize.
@@ -433,13 +477,16 @@ def _attempt_with_backoff(
     last_resort: bool,
     cancel_event: Optional[threading.Event],
     extra_options: Optional[dict[str, Any]],
+    audio_only: bool = False,
 ) -> _Attempt:
     """Run yt-dlp, retrying 429/5xx errors with exponential backoff + jitter."""
     attempt_result = _Attempt(DownloadResult(None, ErrorCode.UNKNOWN, "not started"))
     for attempt in range(1, MAX_SOURCE_ATTEMPTS + 1):
         if cancel_event is not None and cancel_event.is_set():
             return _Attempt(DownloadResult(None, ErrorCode.TIMEOUT, "cancelled before attempt"))
-        attempt_result = _single_attempt(url, job_id, max_height, last_resort, cancel_event, extra_options)
+        attempt_result = _single_attempt(
+            url, job_id, max_height, last_resort, cancel_event, extra_options, audio_only
+        )
         if not attempt_result.retryable or attempt == MAX_SOURCE_ATTEMPTS:
             return attempt_result
         delay = backoff_delay(attempt)
@@ -462,6 +509,7 @@ def download_with_ytdlp(
     cancel_event: Optional[threading.Event] = None,
     max_height: int = DEFAULT_MAX_HEIGHT,
     extra_options: Optional[dict[str, Any]] = None,
+    audio_only: bool = False,
 ) -> DownloadResult:
     """Download a video with yt-dlp into TEMP_DIR using the job-ID prefix.
 
@@ -474,13 +522,18 @@ def download_with_ytdlp(
         cancel_event: Set by the caller to abort the job (e.g. on timeout).
         max_height: Highest resolution to try first.
         extra_options: Additional yt-dlp options (headers, cookie file, ...).
+        audio_only: Download only the audio track (sent as an audio file).
 
     Returns:
         A DownloadResult; this function never raises.
     """
+    if audio_only:
+        max_height = min(max_height, AUDIO_MODE_MAX_HEIGHT)
     try:
         with public_network_only():
-            return _download_capped(url, job_id, platform, cancel_event, max_height, extra_options)
+            return _download_capped(
+                url, job_id, platform, cancel_event, max_height, extra_options, audio_only
+            )
     except Exception as exc:  # Defensive: the caller must never see an exception.
         logger.warning("download_with_ytdlp crashed for job %s", job_id, exc_info=True)
         return DownloadResult(None, ErrorCode.UNKNOWN, f"{type(exc).__name__}: {exc}"[:500])
@@ -493,6 +546,7 @@ def _download_capped(
     cancel_event: Optional[threading.Event],
     max_height: int,
     extra_options: Optional[dict[str, Any]],
+    audio_only: bool = False,
 ) -> DownloadResult:
     """Try each resolution cap until the video fits under the size limit."""
     options = dict(extra_options or {})
@@ -504,7 +558,7 @@ def _download_capped(
     attempt = _Attempt(DownloadResult(None, ErrorCode.UNKNOWN, "not started"))
     for index, cap in enumerate(caps):
         last_resort = index == len(caps) - 1
-        attempt = _attempt_with_backoff(url, job_id, cap, last_resort, cancel_event, options)
+        attempt = _attempt_with_backoff(url, job_id, cap, last_resort, cancel_event, options, audio_only)
         if attempt.try_lower and not last_resort:
             logger.info("Job %s: too large at <=%dp, trying a lower resolution", job_id, cap)
             _remove_partial_files(job_id)
@@ -565,6 +619,17 @@ def get_tiktok(url: str, job_id: str, cancel_event: Optional[threading.Event] = 
     if fallback.error is ErrorCode.UNKNOWN:
         return DownloadResult(None, result.error, f"yt-dlp: {result.detail} | scraper: {fallback.detail}")
     return fallback
+
+
+def download_audio(
+    url: str, job_id: str, platform: str, cancel_event: Optional[threading.Event] = None
+) -> DownloadResult:
+    """Download only the audio of a link as M4A/MP3 (blocking; run in a worker thread).
+
+    Works for every platform yt-dlp supports (Instagram uses its cookie file).
+    There is no TikTok scraper fallback here: the scraper only serves video.
+    """
+    return download_with_ytdlp(url, job_id, platform, cancel_event, audio_only=True)
 
 
 # =============================================================================
@@ -685,11 +750,13 @@ def download_browser_stream(
     probe: ProbeResult,
     job_id: str,
     cancel_event: Optional[threading.Event] = None,
+    audio_only: bool = False,
 ) -> DownloadResult:
     """Download a stream captured by the headless browser.
 
     Reuses the browser's User-Agent, page URL (as Referer) and cookies,
-    because many video CDNs refuse requests without them.
+    because many video CDNs refuse requests without them. ``audio_only``
+    keeps only the audio track (extracted locally with FFmpeg).
     """
     headers = {"Referer": probe.page_url or candidate.url}
     if probe.user_agent:
@@ -698,4 +765,6 @@ def download_browser_stream(
     cookie_path = write_cookie_file(probe.cookies, TEMP_DIR / f"{job_id}{BROWSER_COOKIE_SUFFIX}")
     if cookie_path is not None:
         extra["cookiefile"] = str(cookie_path)
-    return download_with_ytdlp(candidate.url, job_id, "browser", cancel_event, extra_options=extra)
+    return download_with_ytdlp(
+        candidate.url, job_id, "browser", cancel_event, extra_options=extra, audio_only=audio_only
+    )

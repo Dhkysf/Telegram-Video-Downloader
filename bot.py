@@ -68,6 +68,7 @@ from downloaders import (
     cleanup_job,
     clear_temp_dir,
     describe_site,
+    download_audio,
     download_browser_stream,
     get_generic,
     get_instagram,
@@ -149,7 +150,8 @@ WELCOME_TEXT = (
     "🔒 Video berbayar/ber-DRM (Netflix, Disney+, dll.) tidak bisa diunduh.\n"
     "💡 Link boleh diselipkan di dalam kalimat.\n"
     "✅ Sebelum mengunduh, aku tunjukkan dulu videonya supaya kamu bisa memastikan "
-    "itu video yang benar (bukan iklan)."
+    "itu video yang benar (bukan iklan).\n"
+    "🎵 Mau suaranya saja? Tekan tombol <b>Audio saja</b> di pratinjau."
 )
 INVALID_LINK_TEXT = (
     "🤔 Aku tidak menemukan link yang bisa diproses.\n"
@@ -158,6 +160,7 @@ INVALID_LINK_TEXT = (
 ACTIVE_JOB_TEXT = "⏳ Video kamu sebelumnya masih diproses. Tunggu sampai selesai dulu ya."
 COOLDOWN_TEXT = "🕐 Pelan-pelan ya, tunggu {seconds} detik lagi sebelum kirim link baru."
 STATUS_TEXT = "⏳ Mengunduh video dari {platform}..."
+STATUS_AUDIO_TEXT = "⏳ Mengunduh audio dari {platform}..."
 CHECKING_TEXT = "🔎 Memeriksa link dari {site}..."
 BROWSER_TEXT = (
     "🌐 Videonya belum ketemu dengan cara biasa. Sekarang aku buka halamannya pakai "
@@ -174,6 +177,7 @@ EXPIRED_TEXT = "⌛ Pilihan ini sudah kedaluwarsa. Kirim ulang link-nya ya."
 NOT_YOURS_TEXT = "🙅 Tombol ini hanya untuk orang yang mengirim link-nya."
 CANCELLED_NOTE = "❌ Dibatalkan."
 CHOSEN_NOTE = "⬇️ Dipilih: {label}. Sedang diunduh..."
+AUDIO_BUTTON_TEXT = "🎵 Audio saja"
 BROWSER_NOTE = "🔍 Mencari ulang pakai browser..."
 SUCCESS_CAPTION = "✅ Video {platform} berhasil diunduh ({size:.2f} MB)"
 SUCCESS_AUDIO_CAPTION = "✅ Audio {platform} berhasil diunduh ({size:.2f} MB)"
@@ -650,6 +654,7 @@ async def process_download(
     runner: JobRunner,
     state: BotState,
     status: Optional[Message] = None,
+    audio: bool = False,
 ) -> None:
     """Download one video for a user and send it back (always cleans up).
 
@@ -657,18 +662,23 @@ async def process_download(
         message: The user's original message; the video is sent as a reply.
         runner: Blocking ``(job_id, cancel_event) -> DownloadResult``.
         status: Existing status message to reuse, or None to create one.
+        audio: The user asked for audio only (changes the status text).
     """
     job_id = new_job_id(platform)
     started = time.monotonic()
     outcome = ErrorCode.UNKNOWN
     size_mb = 0.0
     cancel_event = threading.Event()
-    logger.info("Job %s started: user=%s platform=%s site=%s", job_id, user_id, platform, site)
+    status_text = (STATUS_AUDIO_TEXT if audio else STATUS_TEXT).format(platform=site)
+    logger.info(
+        "Job %s started: user=%s platform=%s site=%s mode=%s",
+        job_id, user_id, platform, site, "audio" if audio else "video",
+    )
     try:
         if status is None:
-            status = await tg_call(lambda: message.reply_text(STATUS_TEXT.format(platform=site)), "status")
+            status = await tg_call(lambda: message.reply_text(status_text), "status")
         else:
-            await safe_edit(status, STATUS_TEXT.format(platform=site))
+            await safe_edit(status, status_text)
 
         async with state.semaphore:
             result = await run_worker(
@@ -720,10 +730,17 @@ async def process_download(
         )
 
 
-def make_runner(platform: str, url: str, candidate: MediaCandidate, probe: ProbeResult) -> JobRunner:
-    """Return the blocking download function for the chosen candidate."""
+def make_runner(
+    platform: str, url: str, candidate: MediaCandidate, probe: ProbeResult, audio: bool = False
+) -> JobRunner:
+    """Return the blocking download function for the chosen candidate.
+
+    ``audio`` downloads only the audio track (sent with send_audio).
+    """
     if candidate.via_browser:
-        return lambda job_id, event: download_browser_stream(candidate, probe, job_id, event)
+        return lambda job_id, event: download_browser_stream(candidate, probe, job_id, event, audio_only=audio)
+    if audio:
+        return lambda job_id, event: download_audio(url, job_id, platform, event)
     downloader = DOWNLOADERS[platform]
     return lambda job_id, event: downloader(url, job_id, event)
 
@@ -826,7 +843,10 @@ def build_preview(site: str, probe: ProbeResult, allow_browser: bool) -> tuple[s
         for index, candidate in enumerate(probe.candidates, start=1):
             lines.append(candidate_line(index, candidate))
             label = f"{'⚠️ ' if candidate.likely_ad else ''}Video {index} ({format_duration(candidate.duration)})"
-            rows.append([InlineKeyboardButton(label, callback_data=f"dl:TOKEN:{index - 1}")])
+            row = [InlineKeyboardButton(label, callback_data=f"dl:TOKEN:{index - 1}")]
+            if not candidate.audio_only:
+                row.append(InlineKeyboardButton(f"🎵 Audio {index}", callback_data=f"au:TOKEN:{index - 1}"))
+            rows.append(row)
         if all(candidate.likely_ad for candidate in probe.candidates):
             lines.append("")
             lines.append(
@@ -864,6 +884,10 @@ def build_preview(site: str, probe: ProbeResult, allow_browser: bool) -> tuple[s
         lines.append("")
         lines.append(CONFIRM_QUESTION)
         rows.append([InlineKeyboardButton("✅ Ya, unduh", callback_data="dl:TOKEN:0")])
+        # Audio-only sources need no extra button; TikTok without info would rely
+        # on the video-only scraper, so audio is not offered there either.
+        if not candidate.audio_only and not candidate.info_unavailable:
+            rows.append([InlineKeyboardButton(AUDIO_BUTTON_TEXT, callback_data="au:TOKEN:0")])
         if allow_browser and probe.can_try_browser:
             rows.append([InlineKeyboardButton("🔍 Bukan ini, cari pakai browser", callback_data="br:TOKEN")])
         kind = "photo-url" if candidate.thumbnail else "text"
@@ -1041,7 +1065,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the confirmation buttons: download, search with browser, cancel."""
+    """Handle the confirmation buttons: download video/audio, search with browser, cancel."""
     query = update.callback_query
     user = update.effective_user
     if query is None or user is None:
@@ -1069,7 +1093,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _answer(query, "Dibatalkan")
         await finish_preview(pending, CANCELLED_NOTE)
         return
-    if action not in ("dl", "br"):
+    if action not in ("dl", "au", "br"):
         await _answer(query, "")
         return
 
@@ -1078,7 +1102,8 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _answer(query, ACTIVE_JOB_TEXT, alert=True)
         return
     candidate: Optional[MediaCandidate] = None
-    if action == "dl":
+    audio = action == "au"
+    if action in ("dl", "au"):
         try:
             candidate = pending.probe.candidates[int(parts[2])]
         except (IndexError, ValueError):
@@ -1090,10 +1115,13 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _answer(query, "")
         if candidate is not None:
             label = f"video #{int(parts[2]) + 1}" if pending.probe.via_browser else "video ini"
+            if audio:
+                label = f"audio dari {label}"
             await finish_preview(pending, CHOSEN_NOTE.format(label=label))
-            runner = make_runner(pending.platform, pending.url, candidate, pending.probe)
+            runner = make_runner(pending.platform, pending.url, candidate, pending.probe, audio=audio)
             await process_download(
-                context, pending.message, user.id, pending.platform, pending.site, runner, state
+                context, pending.message, user.id, pending.platform, pending.site, runner, state,
+                audio=audio,
             )
         else:
             await finish_preview(pending, BROWSER_NOTE)
@@ -1163,7 +1191,7 @@ def build_application(token: str, settings: Settings) -> Application:
     )
     application.add_handler(CommandHandler(["start", "help"], start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^(dl|br|cx):"))
+    application.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^(dl|au|br|cx):"))
     application.add_error_handler(error_handler)
     return application
 
