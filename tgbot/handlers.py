@@ -17,7 +17,14 @@ from downloaders import MediaCandidate, runtime_info
 from tgbot.flows import check_link, process_download
 from tgbot.links import detect_platform, extract_first_url
 from tgbot.preview import finish_preview
-from tgbot.state import PENDING_TTL_SECONDS, BotState, get_state, is_allowed, try_start_job
+from tgbot.state import (
+    PENDING_TTL_SECONDS,
+    PROBE_CACHE_TTL_SECONDS,
+    BotState,
+    get_state,
+    is_allowed,
+    try_start_job,
+)
 from tgbot.telegram_io import safe_reply, tg_call
 from tgbot.texts import (
     ACTIVE_JOB_TEXT,
@@ -62,7 +69,10 @@ def format_uptime(seconds: float) -> str:
 def build_health_text(state: BotState, info: dict[str, Any]) -> str:
     """Build the HTML /health status message from state and runtime_info()."""
     esc = lambda v: html.escape(str(v))
-    uptime = format_uptime(time.monotonic() - state.started_at)
+    now = time.monotonic()
+    uptime = format_uptime(now - state.started_at)
+    live_pending = sum(1 for p in state.pending.values() if now - p.created < PENDING_TTL_SECONDS)
+    live_cache = sum(1 for created, _ in state.probe_cache.values() if now - created < PROBE_CACHE_TTL_SECONDS)
     max_slots = state.settings.max_concurrent_downloads
     sem_val = getattr(state.semaphore, "_value", None)
     in_use = max(0, max_slots - sem_val) if isinstance(sem_val, int) else "?"
@@ -97,7 +107,7 @@ def build_health_text(state: BotState, info: dict[str, Any]) -> str:
         f"⏱ Uptime: <code>{esc(uptime)}</code>",
         f"📊 Unduhan (sejak mulai): <b>{state.jobs_ok}</b> sukses / <b>{state.jobs_failed}</b> gagal",
         f"⚙️ Aktif: <b>{len(state.active_users)}</b> job · slot unduh: <b>{esc(in_use)}/{max_slots}</b>",
-        f"🗂 Menunggu konfirmasi: <b>{len(state.pending)}</b> · cache info: <b>{len(state.probe_cache)}</b>",
+        f"🗂 Menunggu konfirmasi: <b>{live_pending}</b> · cache info: <b>{live_cache}</b>",
         f"🔧 FFmpeg: <b>{esc(ffmpeg_str)}</b> · Browser: <b>{esc(browser_str)}</b> · Konfirmasi: <b>{esc(confirm_str)}</b>",
         f"📦 Versi: PTB <code>{esc(PTB_VERSION)}</code> · yt-dlp <code>{esc(info.get('yt_dlp_version') or '?')}</code> · Playwright <code>{esc(pw_str)}</code>",
         f"💾 Folder sementara: <code>{esc(temp_str)}</code> · sisa disk: <code>{esc(disk_str)}</code>",
