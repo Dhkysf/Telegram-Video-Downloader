@@ -80,21 +80,25 @@ async def safe_reply(message: Message, text: str, parse_mode: Optional[str] = No
 
 
 async def safe_edit(status: Optional[Message], text: str) -> None:
-    """Edit the status message; BadRequest (deleted/not modified) is ignored."""
+    """Edit the status message; BadRequest and Forbidden are ignored."""
     if status is None:
         return
     try:
         await tg_call(lambda: status.edit_text(text), "edit status")
+    except Forbidden:
+        logger.info("Chat %s blocked the bot; status edit skipped", getattr(status, "chat_id", "?"))
     except BadRequest as exc:
         logger.debug("Ignoring BadRequest on edit: %s", exc)
 
 
 async def safe_delete(status: Optional[Message]) -> None:
-    """Delete the status message; BadRequest (already deleted) is ignored."""
+    """Delete the status message; BadRequest and Forbidden are ignored."""
     if status is None:
         return
     try:
         await tg_call(status.delete, "delete status")
+    except Forbidden:
+        logger.info("Chat %s blocked the bot; status delete skipped", getattr(status, "chat_id", "?"))
     except BadRequest as exc:
         logger.debug("Ignoring BadRequest on delete: %s", exc)
 

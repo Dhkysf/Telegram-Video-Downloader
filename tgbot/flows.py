@@ -114,6 +114,8 @@ async def process_download(
             await safe_edit(status, ERROR_MESSAGES.get(outcome, ERROR_MESSAGES[ErrorCode.UNKNOWN]))
     except Forbidden:
         logger.info("User %s blocked the bot; stopping job %s", user_id, job_id)
+        if outcome is ErrorCode.OK:
+            outcome = ErrorCode.UNKNOWN
     except TelegramError as exc:
         logger.warning("Telegram error in job %s: %s", job_id, type(exc).__name__, exc_info=True)
         if outcome is ErrorCode.OK:
