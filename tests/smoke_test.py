@@ -19,14 +19,17 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from telegram import Chat, Message, MessageEntity, Update, User
 from telegram.constants import ParseMode
+from telegram.error import Forbidden, NetworkError
 
 from downloaders import DownloadResult, ErrorCode, MediaCandidate, ProbeResult, TEMP_DIR
+from downloaders.ytdlp import build_audio_format_selector
 import tgbot.flows
 import tgbot.handlers
 import tgbot.links
 import tgbot.preview
 import tgbot.settings
 import tgbot.state
+import tgbot.telegram_io
 import tgbot.texts
 import tgbot.workers
 
@@ -442,8 +445,167 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Status Bot", health_html)
             self.assertIn("<b>2</b> sukses / <b>1</b> gagal", health_html)
             assert_valid_html(health_html)
+
+            now = time.monotonic()
+            state.pending["live"] = tgbot.state.PendingChoice(100, make_message("https://youtube.com/watch?v=1"), "https://youtube.com/watch?v=1", "youtube", "YouTube", ProbeResult(ErrorCode.OK), now)
+            state.pending["expired"] = tgbot.state.PendingChoice(100, make_message("https://youtube.com/watch?v=2"), "https://youtube.com/watch?v=2", "youtube", "YouTube", ProbeResult(ErrorCode.OK), now - tgbot.state.PENDING_TTL_SECONDS - 10)
+            state.probe_cache[("https://youtube.com/watch?v=1", "youtube", "auto")] = (now, ProbeResult(ErrorCode.OK))
+            state.probe_cache[("https://youtube.com/watch?v=2", "youtube", "auto")] = (now - tgbot.state.PROBE_CACHE_TTL_SECONDS - 10, ProbeResult(ErrorCode.OK))
+            health_counts = tgbot.handlers.build_health_text(state, fake_info)
+            self.assertIn("Menunggu konfirmasi: <b>1</b> · cache info: <b>1</b>", health_counts)
+            self.assertEqual(len(state.pending), 2)
+            self.assertEqual(len(state.probe_cache), 2)
         finally:
             state.semaphore.release()
+
+    async def test_audio_button_and_selector(self) -> None:
+        state = make_state()
+        fake_bot = FakeBot()
+        ctx = make_context(state, fake_bot)
+        probe = ProbeResult(
+            ErrorCode.OK,
+            candidates=[MediaCandidate(url="https://youtube.com/watch?v=aud", title="Song", duration=60, height=720)],
+        )
+
+        def fake_dl_audio(_url: str, job_id: str, _platform: str, _cancel: object) -> DownloadResult:
+            out = TEMP_DIR / f"{job_id}.m4a"
+            out.write_bytes(b"M4ADATA")
+            return DownloadResult(out, ErrorCode.OK, audio_only=True)
+
+        with (
+            patch.object(tgbot.flows, "probe_ytdlp", return_value=probe),
+            patch.object(tgbot.workers, "download_audio", fake_dl_audio),
+        ):
+            await tgbot.handlers.handle_text(Update(1, message=make_message("https://youtube.com/watch?v=aud", user_id=100)), ctx)
+            token = next(iter(state.pending))
+            callbacks = extract_callbacks(self.sent[-1].reply_markup)
+            self.assertIn(f"au:{token}:0", callbacks)
+
+            q_au = FakeQuery(f"au:{token}:0")
+            await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_au, effective_user=User(100, "u", False)), ctx)
+
+        self.assertEqual(len(fake_bot.audios), 1)
+        self.assertEqual(fake_bot.audios[0]["bytes"], b"M4ADATA")
+        self.assertEqual(fake_bot.videos, [])
+        self.assertEqual(state.jobs_ok, 1)
+        self.assertEqual(state.active_users, set())
+
+        audio_only_probe = ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://soundcloud.com/a/b", title="Audio", audio_only=True)])
+        _, markup_ao, _ = tgbot.preview.build_preview("SoundCloud", audio_only_probe, allow_browser=False)
+        self.assertFalse(any(cb.startswith("au:") for cb in extract_callbacks(markup_ao)))
+
+        unavail_probe = ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://tiktok.com/@a/video/1", info_unavailable=True)])
+        _, markup_un, _ = tgbot.preview.build_preview("TikTok", unavail_probe, allow_browser=False)
+        self.assertFalse(any(cb.startswith("au:") for cb in extract_callbacks(markup_un)))
+
+        for can_extract in (True, False):
+            for last_resort in (True, False):
+                self.assertTrue(build_audio_format_selector(can_extract, last_resort))
+
+    async def test_single_flight_concurrent_probes(self) -> None:
+        state = make_state()
+        ctx = make_context(state)
+        calls = 0
+
+        def fake_probe(*_args: object) -> ProbeResult:
+            nonlocal calls
+            calls += 1
+            time.sleep(0.05)
+            return ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://youtube.com/watch?v=sf1", title="SF", duration=10)])
+
+        with patch.object(tgbot.flows, "probe_ytdlp", fake_probe):
+            await asyncio.gather(
+                tgbot.handlers.handle_text(Update(1, message=make_message("https://youtube.com/watch?v=sf1", user_id=100)), ctx),
+                tgbot.handlers.handle_text(Update(2, message=make_message("https://youtube.com/watch?v=sf1", user_id=200)), ctx),
+            )
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(state.pending), 2)
+        self.assertEqual({p.user_id for p in state.pending.values()}, {100, 200})
+        self.assertEqual(state.in_flight_probes, {})
+        self.assertEqual(state.active_users, set())
+
+    async def test_single_flight_first_status_reply_fails(self) -> None:
+        state = make_state()
+        ctx = make_context(state)
+        calls = 0
+
+        def fake_probe(*_args: object) -> ProbeResult:
+            nonlocal calls
+            calls += 1
+            return ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://youtube.com/watch?v=sf2", title="SF2", duration=10)])
+
+        async def flaky_reply_text(msg: Message, text: str, **kwargs: object) -> FakeSentMessage:
+            if msg.from_user and msg.from_user.id == 100:
+                raise NetworkError("boom")
+            sent = FakeSentMessage(text=text, **kwargs)
+            self.sent.append(sent)
+            return sent
+
+        with (
+            patch.object(tgbot.telegram_io, "backoff_delay", return_value=0.0),
+            patch.object(Message, "reply_text", flaky_reply_text),
+            patch.object(tgbot.flows, "probe_ytdlp", fake_probe),
+        ):
+            await asyncio.gather(
+                tgbot.handlers.handle_text(Update(1, message=make_message("https://youtube.com/watch?v=sf2", user_id=100)), ctx),
+                tgbot.handlers.handle_text(Update(2, message=make_message("https://youtube.com/watch?v=sf2", user_id=200)), ctx),
+            )
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(state.pending), 1)
+        self.assertEqual(next(iter(state.pending.values())).user_id, 200)
+        self.assertEqual(state.in_flight_probes, {})
+        self.assertEqual(state.active_users, set())
+
+    async def test_tiktok_info_unavailable_not_cached(self) -> None:
+        state = make_state(user_cooldown_seconds=0.0)
+        ctx = make_context(state)
+        calls = 0
+
+        def fake_probe(*_args: object) -> ProbeResult:
+            nonlocal calls
+            calls += 1
+            return ProbeResult(ErrorCode.OK, candidates=[MediaCandidate(url="https://www.tiktok.com/@a/video/1", info_unavailable=True)])
+
+        with patch.object(tgbot.flows, "probe_ytdlp", fake_probe):
+            await tgbot.handlers.handle_text(Update(1, message=make_message("https://www.tiktok.com/@a/video/1")), ctx)
+            await tgbot.handlers.handle_text(Update(2, message=make_message("https://www.tiktok.com/@a/video/1")), ctx)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(state.probe_cache, {})
+        self.assertEqual(state.active_users, set())
+
+    async def test_forbidden_upload_and_status_delete(self) -> None:
+        def ok_runner(_job_id: str, _cancel: object) -> DownloadResult:
+            out = TEMP_DIR / f"{_job_id}.mp4"
+            out.write_bytes(b"MP4")
+            return DownloadResult(out, ErrorCode.OK)
+
+        class ForbiddenBot(FakeBot):
+            async def send_video(self, video: object, **kwargs: object) -> FakeSentMessage:
+                raise Forbidden("bot was blocked")
+
+        state1 = make_state()
+        ctx1 = make_context(state1, ForbiddenBot())
+        await tgbot.flows.process_download(ctx1, make_message("https://youtube.com/watch?v=1"), 100, "youtube", "YouTube", ok_runner, state1)
+        self.assertEqual(state1.jobs_failed, 1)
+        self.assertEqual(state1.jobs_ok, 0)
+
+        class ForbiddenDeleteStatus(FakeSentMessage):
+            async def delete(self) -> None:
+                raise Forbidden("bot was blocked")
+
+        state2 = make_state()
+        bot2 = FakeBot()
+        ctx2 = make_context(state2, bot2)
+        await tgbot.flows.process_download(
+            ctx2, make_message("https://youtube.com/watch?v=2"), 100, "youtube", "YouTube", ok_runner, state2,
+            status=ForbiddenDeleteStatus(text="Mengunduh..."),  # type: ignore[arg-type]
+        )
+        self.assertEqual(len(bot2.videos), 1)
+        self.assertEqual(state2.jobs_ok, 1)
+        self.assertEqual(state2.jobs_failed, 0)
 
 
 if __name__ == "__main__":
