@@ -6,6 +6,7 @@ from .controller import (
     ControllerSnapshot,
     SingleInstance,
     format_uptime,
+    stop_standalone_bot,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "ControllerSnapshot",
     "SingleInstance",
     "format_uptime",
+    "stop_standalone_bot",
 ]

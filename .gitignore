@@ -21,4 +21,5 @@ tray.log*
 tray_settings.json
 tray.lock
 tray.ipc
+*.lnk
 AUDIT.md

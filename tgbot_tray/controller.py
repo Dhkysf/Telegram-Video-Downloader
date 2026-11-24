@@ -515,7 +515,7 @@ class SingleInstance:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    def acquire(self, on_activate: Callable[[], None]) -> bool:
+    def acquire(self, on_command: Callable[[str], None]) -> bool:
         """Acquire the lock and start the wake-up listener; return False if already held."""
         try:
             handle = open(self.lock_path, "a+b")
@@ -540,8 +540,9 @@ class SingleInstance:
         except OSError:
             pass
 
+        allowed = {"SHOW", "START", "SHOW_START", "STOP"}
+
         def _serve() -> None:
-            expected = f"SHOW {nonce}"
             while not self._stop_event.is_set():
                 try:
                     conn, _ = sock.accept()
@@ -555,9 +556,10 @@ class SingleInstance:
                         data = conn.recv(128).decode("ascii", errors="ignore").strip()
                     except OSError:
                         continue
-                    if data == expected:
+                    parts = data.split(" ", 1)
+                    if len(parts) == 2 and parts[0] in allowed and parts[1] == nonce:
                         try:
-                            on_activate()
+                            on_command(parts[0])
                         except Exception:
                             pass
 
@@ -565,15 +567,15 @@ class SingleInstance:
         self._thread.start()
         return True
 
-    def notify_existing(self) -> bool:
-        """Signal an already-running instance to show its window."""
+    def notify_existing(self, command: str = "SHOW") -> bool:
+        """Send an authenticated command to an already-running instance."""
         for _ in range(5):
             try:
                 raw = self.ipc_path.read_text(encoding="ascii").strip()
                 port_s, nonce = raw.split(" ", 1)
                 port = int(port_s)
                 with socket.create_connection(("127.0.0.1", port), timeout=2.0) as conn:
-                    conn.sendall(f"SHOW {nonce}\n".encode("ascii"))
+                    conn.sendall(f"{command} {nonce}\n".encode("ascii"))
                 return True
             except (OSError, ValueError):
                 time.sleep(0.1)
@@ -599,3 +601,75 @@ class SingleInstance:
             except OSError:
                 pass
             self._handle = None
+
+
+def _is_lock_held(lock_path: Path) -> bool:
+    """Return True if ``lock_path`` exists and is currently locked by another process."""
+    try:
+        handle = open(lock_path, "r+b")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        _lock_file(handle)
+    except OSError:
+        handle.close()
+        return True
+    try:
+        _unlock_file(handle)
+    except OSError:
+        pass
+    handle.close()
+    return False
+
+
+def stop_standalone_bot(
+    project_root: Path = PROJECT_ROOT,
+    stop_timeout: float = DEFAULT_STOP_TIMEOUT,
+) -> bool:
+    """Stop a standalone ``bot.py`` (running without the tray app) via ``stop.request``.
+
+    Returns True if a running standalone bot was found and stopped.
+    """
+    root = Path(project_root).resolve()
+    lock_path = root / "bot.lock"
+    stop_file = root / "stop.request"
+    if not _is_lock_held(lock_path):
+        stop_file.unlink(missing_ok=True)
+        return False
+
+    try:
+        stop_file.write_text("stop\n", encoding="utf-8")
+    except OSError:
+        pass
+
+    deadline = time.monotonic() + stop_timeout
+    while time.monotonic() < deadline:
+        if not _is_lock_held(lock_path):
+            stop_file.unlink(missing_ok=True)
+            return True
+        time.sleep(0.15)
+
+    if os.name == "nt":
+        ps_cmd = (
+            f"$dir = '{str(root).replace(chr(39), chr(39)*2)}'; "
+            "Get-CimInstance Win32_Process | Where-Object { "
+            "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
+            "$_.CommandLine -like '*bot.py*' -and "
+            "($_.CommandLine.IndexOf($dir, [StringComparison]::OrdinalIgnoreCase) -ge 0) "
+            "} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                creationflags=WIN_NO_WINDOW,
+            )
+        except Exception:
+            pass
+    stop_file.unlink(missing_ok=True)
+    return True

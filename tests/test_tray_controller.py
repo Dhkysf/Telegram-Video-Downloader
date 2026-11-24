@@ -26,6 +26,9 @@ from tgbot_tray.controller import (
     DEFAULT_STABLE_RUN_SECONDS,
     SingleInstance,
     _kill_tree_win32,
+    _lock_file,
+    _unlock_file,
+    stop_standalone_bot,
 )
 
 FAKE_BOT_SCRIPT = """\
@@ -296,16 +299,141 @@ class TrayControllerTests(unittest.TestCase):
 
     def test_single_instance_lock_and_ipc_wake(self) -> None:
         lock_file = self.root / "tray.lock"
+        received: list[str] = []
         woken = threading.Event()
         first = SingleInstance(lock_file)
         second = SingleInstance(lock_file)
         self.addCleanup(first.release)
 
-        self.assertTrue(first.acquire(woken.set))
-        self.assertFalse(second.acquire(lambda: None))
-        self.assertTrue(second.notify_existing())
+        def _on_cmd(cmd: str) -> None:
+            received.append(cmd)
+            woken.set()
+
+        self.assertTrue(first.acquire(_on_cmd))
+        self.assertFalse(second.acquire(lambda _cmd: None))
+        self.assertTrue(second.notify_existing("SHOW"))
         self.assertTrue(woken.wait(timeout=2.0))
+        self.assertEqual(received, ["SHOW"])
+
+        for cmd in ("START", "SHOW_START", "STOP"):
+            woken.clear()
+            self.assertTrue(second.notify_existing(cmd))
+            self.assertTrue(woken.wait(timeout=2.0))
+        self.assertEqual(received, ["SHOW", "START", "SHOW_START", "STOP"])
         first.release()
+
+    def test_parse_args_flags(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("tray_app", PROJECT_ROOT / "tray_app.pyw")
+        assert spec is not None and spec.loader is not None
+        tray_app = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tray_app)
+
+        for argv, expected in [
+            ([], (False, False, False, False)),
+            (["--hidden"], (True, False, False, False)),
+            (["--start"], (False, True, False, False)),
+            (["--hidden", "--start"], (True, True, False, False)),
+            (["--stop"], (False, False, True, False)),
+            (["--selftest"], (False, False, False, True)),
+        ]:
+            ns = tray_app.parse_args(argv)
+            self.assertEqual((ns.hidden, ns.start, ns.stop, ns.selftest), expected)
+
+    def test_venv_relaunch_decision(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("tray_app", PROJECT_ROOT / "tray_app.pyw")
+        assert spec is not None and spec.loader is not None
+        tray_app = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tray_app)
+
+        spawned: list[tuple[list[str], str]] = []
+        errors: list[tuple[str, str]] = []
+
+        def fake_popen(cmd, cwd=None, env=None):
+            spawned.append((list(cmd), str(cwd)))
+            return None
+
+        # 1. Already in project venv -> no spawn.
+        res = tray_app.ensure_venv(
+            ["--hidden"],
+            project_root=self.root,
+            prefix=self.root / ".venv",
+            popen_fn=fake_popen,
+            show_error_fn=lambda t, m: errors.append((t, m)),
+        )
+        self.assertEqual(res, "ok")
+        self.assertEqual(spawned, [])
+
+        # 2. Outside venv, pythonw.exe missing -> error dialog, no spawn.
+        res = tray_app.ensure_venv(
+            [],
+            project_root=self.root,
+            prefix=self.root / "sys_python",
+            popen_fn=fake_popen,
+            show_error_fn=lambda t, m: errors.append((t, m)),
+        )
+        self.assertEqual(res, "missing_venv")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("python -m venv .venv", errors[0][1])
+        self.assertIn("pip install -r requirements.txt", errors[0][1])
+
+        # 3. Outside venv, pythonw.exe present -> relaunches with absolute paths.
+        pythonw = self.root / ".venv" / "Scripts" / "pythonw.exe"
+        pythonw.parent.mkdir(parents=True, exist_ok=True)
+        pythonw.write_text("", encoding="ascii")
+        script = self.root / "tray_app.pyw"
+        res = tray_app.ensure_venv(
+            ["--hidden", "--start"],
+            project_root=self.root,
+            script_path=script,
+            prefix=self.root / "sys_python",
+            popen_fn=fake_popen,
+            show_error_fn=lambda t, m: errors.append((t, m)),
+        )
+        self.assertEqual(res, "relaunched")
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(
+            spawned[0][0],
+            [str(pythonw.resolve()), str(script.resolve()), "--hidden", "--start"],
+        )
+        self.assertEqual(spawned[0][1], str(self.root.resolve()))
+
+    def test_stop_standalone_bot(self) -> None:
+        # No bot.lock -> returns False.
+        self.assertFalse(stop_standalone_bot(self.root, stop_timeout=1.0))
+
+        # Simulate standalone bot holding bot.lock and exiting when stop.request appears.
+        lock_file = self.root / "bot.lock"
+        stop_file = self.root / "stop.request"
+        handle = open(lock_file, "a+b")
+        _lock_file(handle)
+        released = threading.Event()
+
+        def _fake_bot() -> None:
+            try:
+                _wait_until(stop_file.exists, timeout=3.0)
+            finally:
+                _unlock_file(handle)
+                handle.close()
+                released.set()
+
+        t = threading.Thread(target=_fake_bot, daemon=True)
+        t.start()
+        self.assertTrue(stop_standalone_bot(self.root, stop_timeout=3.0))
+        self.assertTrue(released.wait(timeout=2.0))
+        self.assertFalse(stop_file.exists())
+
+    def test_app_icon_sizes(self) -> None:
+        from PIL import Image
+
+        ico_path = PROJECT_ROOT / "assets" / "app.ico"
+        self.assertTrue(ico_path.is_file())
+        with Image.open(ico_path) as img:
+            self.assertEqual(img.format, "ICO")
+            self.assertEqual(img.info.get("sizes"), {(16, 16), (32, 32), (48, 48), (256, 256)})
 
 
 if __name__ == "__main__":

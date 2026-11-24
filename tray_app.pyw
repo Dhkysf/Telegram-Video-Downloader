@@ -9,15 +9,13 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Callable, Optional
-
-from PIL import Image, ImageDraw
-import pystray
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tgbot_tray import (
     BotController,
@@ -25,11 +23,17 @@ from tgbot_tray import (
     ControllerSnapshot,
     SingleInstance,
     format_uptime,
+    stop_standalone_bot,
 )
+
+if TYPE_CHECKING:
+    from PIL import Image
+    import pystray
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 SETTINGS_FILE: Path = PROJECT_ROOT / "tray_settings.json"
 TRAY_LOG_FILE: Path = PROJECT_ROOT / "tray.log"
+APP_ICON_FILE: Path = PROJECT_ROOT / "assets" / "app.ico"
 TRAY_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 STATUS_COLORS: dict[BotStatus, str] = {
@@ -40,6 +44,55 @@ STATUS_COLORS: dict[BotStatus, str] = {
 }
 
 logger = logging.getLogger("tray_app")
+
+
+def is_in_project_venv(
+    project_root: Path = PROJECT_ROOT,
+    prefix: Optional[Path] = None,
+) -> bool:
+    """Return True if the current Python interpreter is inside ``<project_root>/.venv``."""
+    actual = os.path.normcase(str((prefix or Path(sys.prefix)).resolve()))
+    expected = os.path.normcase(str((Path(project_root) / ".venv").resolve()))
+    return actual == expected
+
+
+def _show_tk_error(title: str, message: str) -> None:
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror(title, message, parent=root)
+    root.destroy()
+
+
+def ensure_venv(
+    argv: list[str],
+    *,
+    project_root: Path = PROJECT_ROOT,
+    script_path: Optional[Path] = None,
+    prefix: Optional[Path] = None,
+    popen_fn: Callable[..., object] = subprocess.Popen,
+    show_error_fn: Callable[[str, str], None] = _show_tk_error,
+) -> str:
+    """Re-launch under ``.venv\\Scripts\\pythonw.exe`` if not already in the project venv."""
+    if is_in_project_venv(project_root, prefix) or os.environ.get("_TRAY_VENV_RELAUNCHED") == "1":
+        return "ok"
+
+    root = Path(project_root).resolve()
+    venv_pythonw = (root / ".venv" / "Scripts" / "pythonw.exe").resolve()
+    if venv_pythonw.is_file():
+        env = os.environ.copy()
+        env["_TRAY_VENV_RELAUNCHED"] = "1"
+        target_script = str((script_path or Path(__file__)).resolve())
+        popen_fn([str(venv_pythonw), target_script, *argv], cwd=str(root), env=env)
+        return "relaunched"
+
+    show_error_fn(
+        "Virtual environment missing",
+        "Could not find .venv\\Scripts\\pythonw.exe.\n\n"
+        "Create the virtual environment and install dependencies first:\n"
+        "  python -m venv .venv\n"
+        "  .venv\\Scripts\\python -m pip install -r requirements.txt",
+    )
+    return "missing_venv"
 
 
 class _TokenRedactingFormatter(logging.Formatter):
@@ -100,12 +153,28 @@ def save_tray_settings(settings: dict[str, bool], path: Path = SETTINGS_FILE) ->
         tmp.unlink(missing_ok=True)
 
 
-def make_tray_icon(color_hex: str) -> Image.Image:
+def make_tray_icon(color_hex: str) -> "Image.Image":
     """Draw a 64x64 status circle icon at runtime using Pillow."""
+    from PIL import Image, ImageDraw
+
     image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     draw.ellipse((6, 6, 58, 58), fill=color_hex, outline="#1f2937", width=4)
     return image
+
+
+def ensure_app_icon(path: Path = APP_ICON_FILE) -> Path:
+    """Create ``assets/app.ico`` (16/32/48/256 px) if it does not already exist."""
+    if path.is_file():
+        return path
+    from PIL import Image, ImageDraw
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((24, 24, 232, 232), fill="#2ecc71", outline="#1f2937", width=16)
+    image.save(path, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (256, 256)])
+    return path
 
 
 class TrayApp:
@@ -116,9 +185,13 @@ class TrayApp:
         instance: Optional[SingleInstance] = None,
         *,
         selftest: bool = False,
+        start_hidden: bool = False,
+        force_start: bool = False,
     ) -> None:
         self._instance = instance
         self._selftest = selftest
+        self._start_hidden = start_hidden
+        self._force_start = force_start
         self._closing = False
         self._action_busy = False
         self._settings = load_tray_settings()
@@ -130,7 +203,7 @@ class TrayApp:
             logger_inst=logging.getLogger("tray_app.controller"),
         )
 
-        self._icons: dict[str, Image.Image] = {
+        self._icons: dict[str, "Image.Image"] = {
             color: make_tray_icon(color)
             for color in set(STATUS_COLORS.values())
         }
@@ -138,6 +211,10 @@ class TrayApp:
         self.root = tk.Tk()
         self.root.title("Telegram Video Bot")
         self.root.resizable(False, False)
+        try:
+            self.root.iconbitmap(default=str(ensure_app_icon()))
+        except tk.TclError:
+            pass
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.bind("<Unmap>", self._on_unmap)
 
@@ -199,7 +276,9 @@ class TrayApp:
             side="left"
         )
 
-    def _build_tray_icon(self) -> pystray.Icon:
+    def _build_tray_icon(self) -> "pystray.Icon":
+        import pystray
+
         menu = pystray.Menu(
             pystray.MenuItem("Show", lambda _icon, _item: self._schedule_ui(self.show_window), default=True),
             pystray.MenuItem(
@@ -243,6 +322,17 @@ class TrayApp:
             self.root.after(0, fn)
         except tk.TclError:
             pass
+
+    def handle_ipc_command(self, command: str) -> None:
+        """Dispatch an IPC command from a second launch onto the Tk thread."""
+        if command == "SHOW":
+            self._schedule_ui(self.show_window)
+        elif command == "START":
+            self._schedule_ui(self._do_start)
+        elif command == "SHOW_START":
+            self._schedule_ui(lambda: (self.show_window(), self._do_start()))
+        elif command == "STOP":
+            self._schedule_ui(self._do_stop)
 
     def _on_controller_state(self, snap: ControllerSnapshot) -> None:
         self._schedule_ui(lambda: self._apply_snapshot(snap))
@@ -400,46 +490,90 @@ class TrayApp:
 
     def run(self) -> None:
         """Start the tray icon thread, optional auto-start, and Tk mainloop."""
+        if self._start_hidden:
+            self.root.withdraw()
         threading.Thread(target=self._icon.run, name="pystray", daemon=True).start()
         self.root.after(1000, self._tick)
-        if self._auto_start:
+        if self._force_start or self._auto_start:
             self._do_start()
         self.root.mainloop()
 
 
-def main() -> None:
-    """CLI entry point for ``tray_app.pyw``."""
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """Parse command-line flags for ``tray_app.pyw``."""
     parser = argparse.ArgumentParser(description="Telegram Video Bot Tray Controller")
+    parser.add_argument(
+        "--hidden",
+        action="store_true",
+        help="Start in the system tray without showing the window.",
+    )
+    parser.add_argument(
+        "--start",
+        action="store_true",
+        help="Start the bot immediately when the tray app opens.",
+    )
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop the running bot (via tray IPC or standalone stop.request) and exit.",
+    )
     parser.add_argument(
         "--selftest",
         action="store_true",
         help="Build the UI objects and exit 0 without starting the bot.",
     )
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entry point for ``tray_app.pyw``."""
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    venv_status = ensure_venv(raw_argv)
+    if venv_status == "relaunched":
+        return 0
+    if venv_status == "missing_venv":
+        return 1
+
+    args = parse_args(raw_argv)
 
     if args.selftest:
         app = TrayApp(selftest=True)
         app.root.update_idletasks()
         assert len(app._icons) == 3
         assert app._icon.menu is not None
+        assert APP_ICON_FILE.is_file()
         app.root.destroy()
-        return
+        return 0
 
     configure_tray_logging()
     instance = SingleInstance()
-    app_holder: list[TrayApp] = []
 
-    if not instance.acquire(lambda: app_holder[0]._schedule_ui(app_holder[0].show_window) if app_holder else None):
-        instance.notify_existing()
-        return
+    if args.stop:
+        if instance.notify_existing("STOP"):
+            return 0
+        stop_standalone_bot(PROJECT_ROOT)
+        return 0
+
+    if args.start and args.hidden:
+        ipc_cmd = "START"
+    elif args.start:
+        ipc_cmd = "SHOW_START"
+    else:
+        ipc_cmd = "SHOW"
+
+    app_holder: list[TrayApp] = []
+    if not instance.acquire(lambda cmd: app_holder[0].handle_ipc_command(cmd) if app_holder else None):
+        instance.notify_existing(ipc_cmd)
+        return 0
 
     try:
-        app = TrayApp(instance=instance)
+        app = TrayApp(instance=instance, start_hidden=args.hidden, force_start=args.start)
         app_holder.append(app)
         app.run()
     finally:
         instance.release()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
