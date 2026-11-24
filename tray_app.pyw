@@ -35,6 +35,8 @@ SETTINGS_FILE: Path = PROJECT_ROOT / "tray_settings.json"
 TRAY_LOG_FILE: Path = PROJECT_ROOT / "tray.log"
 APP_ICON_FILE: Path = PROJECT_ROOT / "assets" / "app.ico"
 TRAY_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+RELAUNCH_ENV_VAR = "TVB_RELAUNCHED"
+RELAUNCH_CLI_TIMEOUT = 60
 
 STATUS_COLORS: dict[BotStatus, str] = {
     BotStatus.RUNNING: "#2ecc71",
@@ -51,8 +53,8 @@ def is_in_project_venv(
     prefix: Optional[Path] = None,
 ) -> bool:
     """Return True if the current Python interpreter is inside ``<project_root>/.venv``."""
-    actual = os.path.normcase(str((prefix or Path(sys.prefix)).resolve()))
-    expected = os.path.normcase(str((Path(project_root) / ".venv").resolve()))
+    actual = os.path.normcase(os.path.realpath(prefix or sys.prefix))
+    expected = os.path.normcase(os.path.realpath(Path(project_root) / ".venv"))
     return actual == expected
 
 
@@ -69,30 +71,55 @@ def ensure_venv(
     project_root: Path = PROJECT_ROOT,
     script_path: Optional[Path] = None,
     prefix: Optional[Path] = None,
-    popen_fn: Callable[..., object] = subprocess.Popen,
+    popen_fn: Optional[Callable[..., object]] = None,
+    run_fn: Optional[Callable[..., subprocess.CompletedProcess[bytes]]] = None,
     show_error_fn: Callable[[str, str], None] = _show_tk_error,
-) -> str:
-    """Re-launch under ``.venv\\Scripts\\pythonw.exe`` if not already in the project venv."""
-    if is_in_project_venv(project_root, prefix) or os.environ.get("_TRAY_VENV_RELAUNCHED") == "1":
-        return "ok"
+) -> Optional[int]:
+    """Re-launch under ``.venv\\Scripts\\python[w].exe`` if not already in the project venv.
 
+    Returns ``None`` when already in the venv (or already relaunched), or an
+    exit code to return from ``main()`` when relaunched or missing.
+    """
+    if is_in_project_venv(project_root, prefix) or os.environ.get(RELAUNCH_ENV_VAR):
+        return None
+
+    cli_mode = any(arg in ("--stop", "--selftest") for arg in argv)
+    exe_name = "python.exe" if cli_mode else "pythonw.exe"
     root = Path(project_root).resolve()
-    venv_pythonw = (root / ".venv" / "Scripts" / "pythonw.exe").resolve()
-    if venv_pythonw.is_file():
+    venv_exe = (root / ".venv" / "Scripts" / exe_name).resolve()
+    if venv_exe.is_file():
         env = os.environ.copy()
-        env["_TRAY_VENV_RELAUNCHED"] = "1"
+        env[RELAUNCH_ENV_VAR] = "1"
         target_script = str((script_path or Path(__file__)).resolve())
-        popen_fn([str(venv_pythonw), target_script, *argv], cwd=str(root), env=env)
-        return "relaunched"
+        cmd = [str(venv_exe), target_script, *argv]
+        if cli_mode:
+            runner = run_fn or subprocess.run
+            try:
+                result = runner(cmd, cwd=str(root), env=env, timeout=RELAUNCH_CLI_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                if sys.stderr is not None:
+                    print(
+                        f"Timed out after {RELAUNCH_CLI_TIMEOUT}s waiting for {exe_name}.",
+                        file=sys.stderr,
+                    )
+                return 1
+            return int(result.returncode)
+        spawner = popen_fn or subprocess.Popen
+        spawner(cmd, cwd=str(root), env=env)
+        return 0
 
-    show_error_fn(
-        "Virtual environment missing",
-        "Could not find .venv\\Scripts\\pythonw.exe.\n\n"
+    msg = (
+        f"Could not find .venv\\Scripts\\{exe_name}.\n\n"
         "Create the virtual environment and install dependencies first:\n"
         "  python -m venv .venv\n"
-        "  .venv\\Scripts\\python -m pip install -r requirements.txt",
+        "  .venv\\Scripts\\python -m pip install -r requirements.txt"
     )
-    return "missing_venv"
+    if cli_mode:
+        if sys.stderr is not None:
+            print(msg, file=sys.stderr)
+    else:
+        show_error_fn("Virtual environment missing", msg)
+    return 1
 
 
 class _TokenRedactingFormatter(logging.Formatter):
@@ -528,11 +555,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[list[str]] = None) -> int:
     """CLI entry point for ``tray_app.pyw``."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    venv_status = ensure_venv(raw_argv)
-    if venv_status == "relaunched":
-        return 0
-    if venv_status == "missing_venv":
-        return 1
+    exit_code = ensure_venv(raw_argv)
+    if exit_code is not None:
+        return exit_code
 
     args = parse_args(raw_argv)
 
