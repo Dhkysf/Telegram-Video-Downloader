@@ -2,17 +2,15 @@
 
 A personal Telegram bot for downloading videos on a Windows PC using `python-telegram-bot` (long polling) and `yt-dlp`. Send a link, inspect the preview, and confirm to receive the video (or audio) back in chat.
 
-> **Note:** This bot is for personal use only; please respect copyright and the rules of each platform.
-
 ## 1. What it is
 
 - **Multi-site support via `yt-dlp`**: TikTok (with an `ssstik.io` scraper fallback), Instagram, X/Twitter, YouTube, SoundCloud, and other public HTTP/HTTPS links.
 - **Preview and confirmation buttons**: Inspects title, duration, quality, estimated size, and thumbnail before downloading anything.
-- **"Audio saja" option**: Download audio-only M4A (or MP3 if already MP3) from supported links (and audio-only sites like SoundCloud are sent as audio).
+- **"Audio saja" option**: Extracts audio as **M4A** (or keeps **MP3** / **M4A** as-is when already in that format) and sends it with `send_audio`.
 - **Headless-browser fallback**: Uses Microsoft Edge via Playwright when `yt-dlp` finds nothing on a generic site, capturing video streams and flagging likely ads.
 - **5-minute probe cache**: Reuses recent probe results for 5 minutes (`PROBE_CACHE_TTL_SECONDS = 300`) to avoid re-probing the same link.
 - **`/ping` and `/health` commands**: Quick liveness check and full runtime status report.
-- **Auto `yt-dlp` update on start**: `tray_app.pyw` updates `yt-dlp` at most once per 24 hours before starting the bot.
+- **Tray app with auto-restart and daily `yt-dlp` update**: `tray_app.pyw` supervises `bot.py`, restarts it with backoff on unexpected exits, and updates `yt-dlp` at most once per 24 hours.
 - **Local-network guard**: Blocks connections and browser traffic to loopback, private LAN, link-local, and CGNAT IP ranges.
 - **50 MB limit**: Enforces Telegram's 50 MB Bot API upload limit with automatic resolution step-down (`720p` → `480p` → `360p` → `240p`).
 
@@ -48,7 +46,23 @@ Expected result: A `.venv` folder is created in the project directory.
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-Expected result: `python-telegram-bot`, `yt-dlp`, `requests`, `playwright`, `pystray`, and `Pillow` are installed inside `.venv`.
+Expected result: `python-telegram-bot`, `yt-dlp`, `requests`, `pycryptodomex`, `playwright`, `pystray`, and `Pillow` are installed inside `.venv`.
+
+3. Create shortcuts (project folder, Desktop, and Windows Startup):
+
+```powershell
+.\create_shortcuts.ps1
+```
+
+Expected result: Creates `Telegram Video Bot.lnk` in the project folder, on your Desktop, and in your Windows Startup folder (the Startup shortcut passes `--hidden --start`).
+
+If PowerShell blocks running `.ps1` scripts, run it with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\create_shortcuts.ps1
+```
+
+Expected result: Same as above, without changing your system execution policy. Re-run `create_shortcuts.ps1` if you ever move the project folder.
 
 ## 4. Configuration
 
@@ -63,7 +77,7 @@ os.environ.setdefault("ALLOWED_USER_IDS", "123456789")
 
 > **How `config.py` works:** `config.py` is only read when `TELEGRAM_BOT_TOKEN` is **not** set in the environment. Using `os.environ.setdefault(...)` inside `config.py` lets you keep your optional settings in the same file.
 >
-> **Recommended:** Set `ALLOWED_USER_IDS` to your Telegram user ID so the bot silently ignores everyone else.
+> **Strongly recommended:** Set `ALLOWED_USER_IDS` to your Telegram user ID so the bot silently ignores everyone else (especially important if you share or fork a public repo).
 
 ### Environment Variables
 
@@ -80,115 +94,125 @@ os.environ.setdefault("ALLOWED_USER_IDS", "123456789")
 
 ## 5. Running
 
-### Manual run
+### Tray app (recommended for daily use)
 
-```powershell
-.venv\Scripts\python bot.py
-```
-
-Expected result: The bot starts polling Telegram and writes logs to `bot.log` (and echoes them to the console). Press `Ctrl+C` to stop.
-
-### Windows Tray Controller (recommended for daily use)
-
-Double-click `tray_app.pyw` (or the `Telegram Video Bot` shortcut) or run:
+Double-click `Telegram Video Bot.lnk` (or `tray_app.pyw`), or run:
 
 ```powershell
 .venv\Scripts\pythonw.exe tray_app.pyw
 ```
 
-- **Auto-venv**: If launched with system Python, `tray_app.pyw` re-launches itself using `.venv\Scripts\pythonw.exe`.
-- **Status window & tray icon**: Shows `Running` (green), `Restarting` (yellow), or `Stopped` / `Crashed` (red), plus uptime and last exit code. Closing (`X`) or minimizing hides the window to the system tray; double-clicking the tray icon (or launching `tray_app.pyw` again) restores it.
-- **CLI flags**: `--hidden` (start in tray only), `--start` (start the bot immediately, combinable with `--hidden`), `--stop` (stop the running bot and exit).
-- **Controls**: `Start`, `Stop`, `Restart`, `Open log`, `Open folder`, `"Start bot when app opens"` (saved in `tray_settings.json`), and `Exit` (prompts before stopping a running bot).
-- **Graceful stop**: Clicking `Stop` (or running `.venv\Scripts\pythonw.exe tray_app.pyw --stop`) creates `stop.request` and waits up to 15 seconds for `bot.py` to shut down cleanly; if it does not exit in time, the full process tree is force-killed (`taskkill /PID ... /T /F`).
-- **Auto-restart & `yt-dlp` updates**: Restarts automatically with backoff (`10s` → `30s` → `60s` → max `5m`, resetting after `10m` of stable running). Never restarts on fatal exit code `1` or after a user `Stop`. Updates `yt-dlp` at most once per 24 hours (non-fatal).
-- **Autostart shortcuts**: Run `.\create_shortcuts.ps1` in PowerShell to create `Telegram Video Bot.lnk` in the project folder, on the Desktop, and in Startup (`shell:startup`, with `--hidden --start`). Users upgrading from an older setup should delete any legacy Startup shortcut from `shell:startup` (`create_shortcuts.ps1` removes it automatically).
-- **Manual console fallback**: `.venv\Scripts\python.exe bot.py` (run in foreground) and `.venv\Scripts\pythonw.exe tray_app.pyw --stop` (stop).
+Expected result: The tray controller opens (or re-launches itself inside `.venv` if started with system Python) and places an icon in the Windows system tray.
 
-### Logs
+- **Icon colours**: **Green** = `Running`, **Yellow** = `Restarting`, **Red** = `Stopped` or `Crashed`.
+- **Window & tray**: Minimizing or closing (`X`) hides the window to the system tray. Double-click the tray icon (or select **Show**) to restore it.
+- **Tray menu items**: `Show`, `Start`, `Stop`, `Restart`, `Open log`, `Open folder`, `Start bot when app opens` (saved in `tray_settings.json`), and `Exit`.
+- **Autostart at login**: `create_shortcuts.ps1` puts a shortcut in Windows Startup with `--hidden --start` so the bot starts in the background when you sign in.
+- **Auto-restart**: If `bot.py` exits unexpectedly, the controller restarts it with backoff (`10s`, `30s`, `60s`, `300s`). It does **not** restart after exit code `1` (fatal config/token error) or after you click **Stop**.
+- **How Stop works**: Writes `stop.request` for a graceful shutdown, then falls back to `taskkill /PID ... /T /F` (process tree kill) if the bot does not exit in time.
+- **Single instance**: `tray.lock` / `tray.ipc` ensures only one tray app runs (a second launch sends `SHOW` to the existing window), and `bot.lock` ensures only one `bot.py` runs.
 
-- `bot.log`: Main rotating application log (1 MB per file, up to 5 backups: `bot.log.1` .. `bot.log.5`).
-- `tray.log`: Rotating tray controller log (`tray.log.1` .. `tray.log.3`).
-- `bot.update.log`: Output from the `yt-dlp` update.
-- `bot.console.log` / `bot.console.prev.log`: Console stdout/stderr from `bot.py` (rotated on each start).
+### CLI flags for `tray_app.pyw`
 
-## 6. Using the bot
+- `--hidden`: Start minimized to the system tray.
+- `--start`: Automatically start `bot.py` on launch.
+- `--stop`: Stop the running bot (via tray IPC or standalone `stop.request`) and exit.
+- `--selftest`: Verify tray imports, icon generation, and `assets/app.ico`, then exit.
 
-1. Send any supported video link to the bot.
-2. The bot probes the link and replies with a preview (thumbnail or browser screenshot) and inline buttons:
-   - **Ya, unduh** (or numbered stream buttons when multiple streams are found)
-   - **Audio saja** (download audio as M4A, or MP3 if already MP3)
-   - **cari pakai browser** (retry with the headless browser if `yt-dlp` picked the wrong thing)
-   - **Batal** (cancel)
-3. **⚠️ `kemungkinan iklan`**: Flagged on browser-captured streams whose URL, duration, or metadata matches ad heuristics. Avoid picking these unless you know it is the actual video.
-4. **Button expiry**: Confirmation buttons expire after **15 minutes** (`PENDING_TTL_SECONDS = 900`).
+### Manual console fallback
+
+```powershell
+.venv\Scripts\python.exe bot.py
+```
+
+Expected result: The bot starts polling Telegram and writes logs to `bot.log` (and echoes them to the console). Press `Ctrl+C` to stop.
+
+## 6. Logs and files
+
+| File | Purpose | Safe to delete? |
+| --- | --- | --- |
+| `bot.log`, `bot.log.1`..`bot.log.5` | Rotating application log from `bot.py` (max ~6 MB total). | Yes (when stopped) |
+| `bot.console.log`, `bot.console.prev.log` | stdout/stderr captured by `tray_app.pyw` (rotated on start). | Yes (when stopped) |
+| `bot.update.log` | Output from the daily `yt-dlp` update check. | Yes |
+| `tray.log` | Size-rotated log for `tray_app.pyw`. | Yes (when stopped) |
+| `tray_settings.json` | Stores the `Start bot when app opens` preference. | Yes (resets preference) |
+| `bot.pid`, `bot.lock` | Tracks the running `bot.py` PID and prevents duplicate bots. | Only if stale after a crash |
+| `tray.lock`, `tray.ipc` | Prevents duplicate tray instances and handles `SHOW` IPC. | Only if stale after a crash |
+| `stop.request` | Temporary signal file created during graceful stop. | Yes (when stopped) |
+
+## 7. Using the bot
+
+1. Send a supported link to the bot in Telegram.
+2. The bot probes the link (without downloading) and replies with a preview (title, duration, quality, estimated size, and thumbnail or page screenshot).
+3. Choose an inline button:
+   - **Ya, unduh** (or **Stream N**): Download and send the video.
+   - **🎵 Audio saja**: Download audio-only (M4A, or MP3 if already MP3).
+   - **🌐 Cari pakai browser**: Re-probe the page using headless Microsoft Edge.
+   - **❌ Batal**: Cancel the request.
+4. Streams flagged with `⚠️ kemungkinan iklan` are likely advertisements; auto-pick (when `CONFIRM_BEFORE_DOWNLOAD=false`) never selects them.
+5. Confirmation buttons expire after **15 minutes** (`PENDING_TTL_SECONDS = 900`).
 
 ### Commands
 
-- `/start` or `/help`: Show the welcome message and usage instructions.
-- `/ping`: Quick check that the bot is alive (`Pong!`).
-- `/health`: Show uptime, active slots, pending choices, probe cache count, FFmpeg status, browser fallback status, Playwright version, `yt-dlp` version, `python-telegram-bot` version, and `temp_downloads/` usage.
+- `/start`, `/help`: Show usage instructions.
+- `/ping`: Quick liveness check.
+- `/health`: Shows uptime, active/pending jobs, probe cache count, `ffmpeg` status, browser fallback & Playwright version, confirmation mode, `temp_downloads/` usage, and free disk space.
 
-## 7. Instagram cookies
+## 8. Instagram cookies
 
-Some Instagram posts/reels require login cookies:
+Some Instagram posts require a logged-in session:
 
-1. Install the **Get cookies.txt LOCALLY** browser extension.
-2. Log in using a **secondary** Instagram account (never your main account).
-3. Export cookies for `instagram.com` and save the file as `instagram_cookies.txt` in the project root (next to `bot.py`).
-4. **Never share or commit `instagram_cookies.txt`.**
+1. Use a **secondary** Instagram account (never your main account).
+2. Export cookies using the **Get cookies.txt LOCALLY** browser extension.
+3. Save the file as `instagram_cookies.txt` next to `bot.py`.
 
-## 8. Limits
+Never share `instagram_cookies.txt` or commit it to git.
 
-- **50 MB Bot API limit**: Files larger than 50 MB cannot be sent by the bot.
-- **DRM**: DRM-protected streams are detected and dropped.
-- **Live streams**: Live streams are skipped/rejected.
-- **Login-only content**: Content behind logins or paywalls is not supported (except optional Instagram cookies).
-- **CAPTCHA sites**: Sites gated by CAPTCHAs or anti-bot challenges are not supported.
-- **Ad detection is a heuristic**: `kemungkinan iklan` flags likely ads based on hostnames and stream metadata, not a guarantee.
+## 9. Limits
 
-## 9. Troubleshooting
+- **50 MB upload limit**: Telegram Bot API rejects files over 50 MB.
+- **DRM, live streams, login-only content, and CAPTCHAs**: Not supported; DRM streams are intentionally dropped.
+- **Ad detection is a heuristic**: Streams marked `⚠️ kemungkinan iklan` are best-effort guesses based on URL/host/duration patterns.
 
-- **Bot does not start or crashes**: Check `bot.log` and `bot.console.log` for the error.
-- **Downloads fail on a site that used to work**: Update `yt-dlp`:
+## 10. Troubleshooting
+
+- **Tray window does not appear**: Check the Windows system tray overflow (`^` arrow) for the icon, or run `.venv\Scripts\python.exe tray_app.pyw` in PowerShell to see any startup error.
+- **Tray icon is red**: Check `bot.log` and `bot.console.log` (or click **Open log**). Exit code `1` usually means a missing/invalid `TELEGRAM_BOT_TOKEN`.
+- **`Conflict` error in `bot.log`**: Another instance of `bot.py` is already polling with the same token. Stop the other instance (or run `.venv\Scripts\python.exe tray_app.pyw --stop`).
+- **FFmpeg / Edge / Playwright missing**: Install FFmpeg with `winget install Gyan.FFmpeg` (or set `FFMPEG_DIR`), ensure Microsoft Edge is installed, and verify `.venv\Scripts\python -m pip install -r requirements.txt`.
+- **Bot is silent**: Check `ALLOWED_USER_IDS` in `config.py` or your environment—if set, only listed user IDs receive replies.
+- **Update `yt-dlp` manually**: Run `.venv\Scripts\python -m pip install -U yt-dlp` (with the bot stopped).
+
+## 11. Upgrading from the old `.bat`/`.vbs` setup
+
+`start_bot.bat`, `stop_bot.bat`, and `start_bot_hidden.vbs` have been removed. Delete any old Startup shortcut pointing to them, then run `.\create_shortcuts.ps1` (which also cleans up old `.vbs` Startup shortcuts automatically).
+
+## 12. Development
+
+```
+bot.py                  Entry point
+tray_app.pyw            Windows system-tray controller UI
+tgbot_tray/             Tray controller backend (supervisor, log rotation, IPC)
+tgbot/                  Telegram bot package (handlers, flows, preview, state, settings)
+downloaders/            yt-dlp, TikTok scraper, Playwright browser, GuardProxy
+tests/                  Offline unit and smoke tests
+create_shortcuts.ps1    Creates project, Desktop, and Startup shortcuts
+```
+
+Run all offline checks:
 
 ```powershell
-.venv\Scripts\python -m pip install -U yt-dlp
+.venv\Scripts\python.exe tests/smoke_test.py
+.venv\Scripts\python.exe tests/test_tray_controller.py
+.venv\Scripts\python.exe tray_app.pyw --selftest
 ```
 
-Expected result: `yt-dlp` updates to the latest version.
+Expected result: All tests pass and `--selftest` exits `0`.
 
-- **FFmpeg not found**: Install it with `winget install Gyan.FFmpeg` or set `FFMPEG_DIR` to the folder containing `ffmpeg.exe`.
-- **Browser fallback unavailable**: Ensure Microsoft Edge is installed, or run `.venv\Scripts\python -m playwright install chromium` if neither Edge nor Chrome is present.
-- **Bot is silent / ignores messages**: Check `ALLOWED_USER_IDS` in `config.py` or your environment variables and verify your Telegram user ID is listed.
+- AI agents: read `AGENTS.md` and `.agents/rules/` before editing.
+- Commits follow Conventional Commits (`type(section): description`).
+- Never commit `config.py`, `instagram_cookies.txt`, logs, or `*.lnk`.
 
-## 10. Development
+## 13. Disclaimer
 
-### Project layout
-
-```text
-bot.py                  Entry point (main, build_application)
-tray_app.pyw            Windows system-tray controller UI (pythonw.exe)
-tgbot/                  Telegram bot package (handlers, flows, preview, state, settings, texts, links, workers, telegram_io)
-tgbot_tray/             Tray controller backend (process supervisor, log rotation, single-instance IPC)
-downloaders/            Media probing & downloading (ytdlp, tiktok, probe, browser, streaminfo, guardproxy, common)
-tests/smoke_test.py     Offline bot smoke tests
-tests/test_tray_controller.py  Offline tray controller & graceful stop tests
-create_shortcuts.ps1    Creates project-folder, Desktop, and Startup shortcuts for tray_app.pyw
-assets/app.ico          Application icon for tray_app.pyw and shortcuts
-requirements.txt        Python dependencies
-```
-
-### Running tests
-
-```powershell
-.venv\Scripts\python tests\smoke_test.py
-```
-
-Expected result: All smoke tests pass (`OK`).
-
-### Contributing
-
-- Read [AGENTS.md](AGENTS.md) and `.agents/rules/` before making changes (especially if you are an AI coding agent).
-- Use **Conventional Commits** (`type(section): description`, e.g. `feat(tiktok): support slideshow download`).
-- **Never commit** `config.py`, `instagram_cookies.txt`, `bot.log`, `.env`, `.venv/`, or `temp_downloads/`.
+For personal use only. Respect copyright and the terms of service of each platform. Do not use this tool to circumvent DRM.
