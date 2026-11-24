@@ -16,4 +16,9 @@ bot.log*
 bot.console*.log
 bot.update.log
 bot.lock
+stop.request
+tray.log*
+tray_settings.json
+tray.lock
+tray.ipc
 AUDIT.md

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import os
@@ -11,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import BinaryIO, Iterator, Optional
+from typing import BinaryIO, Callable, Iterator, Optional
 
 from downloaders import PROJECT_ROOT, browser_available
 
@@ -27,6 +28,7 @@ FALSE_VALUES = frozenset({"0", "false", "no", "off", "tidak"})
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOG_FILE: Path = PROJECT_ROOT / "bot.log"
 LOCK_FILE: Path = PROJECT_ROOT / "bot.lock"
+STOP_REQUEST_FILE: Path = PROJECT_ROOT / "stop.request"
 LOG_MAX_BYTES = 1024 * 1024  # Rotate at 1 MB...
 LOG_BACKUP_COUNT = 5  # ...keeping bot.log.1 .. bot.log.5 (max ~6 MB total).
 
@@ -145,6 +147,32 @@ def instance_lock(path: Path = LOCK_FILE) -> Iterator[bool]:
         except OSError:
             pass
         handle.close()
+
+
+def clear_stop_request(path: Path = STOP_REQUEST_FILE) -> bool:
+    """Remove ``path`` if it exists; return True if a stop request was present."""
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning("Could not remove %s: %s", path.name, exc)
+        return False
+
+
+async def watch_stop_request(
+    on_stop: Callable[[], None],
+    path: Path = STOP_REQUEST_FILE,
+    interval: float = 1.0,
+) -> None:
+    """Poll for ``path`` and invoke ``on_stop`` once when found."""
+    while True:
+        if clear_stop_request(path):
+            logger.info("Stop requested via %s; shutting down gracefully", path.name)
+            on_stop()
+            return
+        await asyncio.sleep(interval)
 
 
 def load_token() -> Optional[str]:

@@ -19,3 +19,7 @@ pycryptodomex~=3.20
 # On Windows it uses the built-in Microsoft Edge, nothing else to install.
 # Without Edge/Chrome, run once: python -m playwright install chromium
 playwright~=1.65
+
+# Windows system-tray controller UI (tray_app.pyw).
+pystray>=0.19
+Pillow>=10.0
