@@ -7,6 +7,8 @@ description: "Project layout, setup, run commands, and environment configuration
 
 ```
 bot.py                  Entry point: main() and build_application() only.
+tray_app.pyw            Windows system-tray controller UI (pystray + tkinter + Pillow).
+tgbot_tray/             Tray controller backend (controller.py: supervisor, log rotation, IPC).
 tgbot/                  Telegram bot package (one-way imports: texts/links/settings
                         -> state -> telegram_io -> preview/workers -> flows -> handlers).
   __init__.py           Package marker (no imports or side effects).
@@ -21,6 +23,7 @@ tgbot/                  Telegram bot package (one-way imports: texts/links/setti
   handlers.py           start/help, ping, health, handle_text, handle_choice, error_handler.
 tests/
   smoke_test.py         Offline smoke tests (stdlib + PTB only, no token/network).
+  test_tray_controller.py  Offline tray controller and graceful stop tests.
 downloaders/            Everything that touches the network for media. Never imports telegram.
   __init__.py           Re-exports the public API (keep __all__ in sync).
   common.py             Shared constants, ErrorCode, DownloadResult, MediaCandidate,
@@ -36,9 +39,10 @@ downloaders/            Everything that touches the network for media. Never imp
   streaminfo.py         Describe captured streams (HLS/DASH/MP4 parsing), drop
                         segments/DRM/live, flag ads, rank candidates.
   guardproxy.py         Local HTTP/CONNECT proxy; all browser traffic goes through it.
-requirements.txt        PTB ~=22.5, yt-dlp >= recent, requests ~=2.32, playwright ~=1.65.
-start_bot.bat           Windows restart loop (CRLF line endings!).
-start_bot_hidden.vbs    Runs start_bot.bat with no window (CRLF line endings!).
+requirements.txt        PTB ~=22.5, yt-dlp >= recent, requests ~=2.32, playwright ~=1.65, pystray >= 0.19, Pillow >= 10.0.
+create_shortcuts.ps1    Creates Desktop + Startup shortcuts for tray_app.pyw.
+start_bot.bat           Fallback Windows restart loop (CRLF line endings!).
+start_bot_hidden.vbs    Fallback: runs start_bot.bat with no window (CRLF line endings!).
 .gitignore              Ignores config.py, .env, instagram_cookies.txt, temp_downloads/, ...
 ```
 

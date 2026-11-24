@@ -51,6 +51,9 @@ description: "Probe/confirmation flow and Telegram API rules for bot.py and tgbo
   - Always answer the callback query (`_answer`), even on errors.
 - **Commands:** `/start`, `/help`, `/ping`, `/health` (registered in
   `build_application()` and `post_init` via `set_my_commands`).
+- **Graceful stop:** `post_init` starts `watch_stop_request(application.stop_running)`
+  to poll `stop.request` every 1 s; `post_shutdown` cancels it, and `main()`
+  clears any stale `stop.request` at startup.
 - **Download runner:** `make_runner()` returns `DOWNLOADERS[platform]` for
   yt-dlp candidates, or `download_browser_stream(candidate, probe, ...)` for
   browser candidates.

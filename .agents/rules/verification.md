@@ -10,10 +10,11 @@ API). Before reporting done, run the checks that apply, and say plainly which
 ones you ran and which you could not run (e.g. nothing here talks to the real
 Telegram API without a token).
 
-1. **Compile and lint:** `python -m compileall -q bot.py tgbot downloaders tests` (works
-   on Windows shells too). If available, also
-   `python -m pyflakes bot.py tgbot/ downloaders/ tests/`.
-   Run `python tests/smoke_test.py` before every commit.
+1. **Compile and lint:** `python -m compileall -q bot.py tgbot tgbot_tray downloaders tests`
+   and `python -m py_compile tray_app.pyw` (works on Windows shells too). If available, also
+   `python -m pyflakes bot.py tray_app.pyw tgbot/ tgbot_tray/ downloaders/ tests/`.
+   Run `python tests/smoke_test.py`, `python tests/test_tray_controller.py`, and
+   `python tray_app.pyw --selftest` before every commit.
 2. **Pure logic.** Test `extract_first_url` and `detect_platform` with real PTB
    `Message`/`MessageEntity` objects (`parse_entities` needs them).
 

@@ -12,7 +12,7 @@ A personal Telegram bot for downloading videos on a Windows PC using `python-tel
 - **Headless-browser fallback**: Uses Microsoft Edge via Playwright when `yt-dlp` finds nothing on a generic site, capturing video streams and flagging likely ads.
 - **5-minute probe cache**: Reuses recent probe results for 5 minutes (`PROBE_CACHE_TTL_SECONDS = 300`) to avoid re-probing the same link.
 - **`/ping` and `/health` commands**: Quick liveness check and full runtime status report.
-- **Auto `yt-dlp` update on start**: `start_bot.bat` updates `yt-dlp` once at launch before starting the bot loop.
+- **Auto `yt-dlp` update on start**: `tray_app.pyw` updates `yt-dlp` at most once per 24 hours before starting the bot (`start_bot.bat` updates once at launch).
 - **Local-network guard**: Blocks connections and browser traffic to loopback, private LAN, link-local, and CGNAT IP ranges.
 - **50 MB limit**: Enforces Telegram's 50 MB Bot API upload limit with automatic resolution step-down (`720p` → `480p` → `360p` → `240p`).
 
@@ -48,7 +48,7 @@ Expected result: A `.venv` folder is created in the project directory.
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-Expected result: `python-telegram-bot`, `yt-dlp`, `requests`, and `playwright` are installed inside `.venv`.
+Expected result: `python-telegram-bot`, `yt-dlp`, `requests`, `playwright`, `pystray`, and `Pillow` are installed inside `.venv`.
 
 ## 4. Configuration
 
@@ -88,29 +88,34 @@ os.environ.setdefault("ALLOWED_USER_IDS", "123456789")
 
 Expected result: The bot starts polling Telegram and writes logs to `bot.log` (and echoes them to the console). Press `Ctrl+C` to stop.
 
-### Hidden autostart on Windows
+### Windows Tray Controller (recommended for daily use)
 
-1. Right-click `start_bot_hidden.vbs` → **Create shortcut**.
-2. Press `Win+R`, type `shell:startup`, and press `Enter`.
-3. Move the shortcut into the Startup folder.
+Run with `pythonw.exe` (no console window):
 
-`start_bot_hidden.vbs` launches `start_bot.bat` with no visible window.
+```powershell
+.venv\Scripts\pythonw.exe tray_app.pyw
+```
 
-### What `start_bot.bat` does
+- **Status window & tray icon**: Shows `Running` (green), `Restarting` (yellow), or `Stopped` / `Crashed` (red), plus uptime and last exit code. Closing (`X`) or minimizing hides the window to the system tray; double-clicking the tray icon restores it.
+- **Controls**: `Start`, `Stop`, `Restart`, `Open log`, `Open folder`, `"Start bot when app opens"` (saved in `tray_settings.json`), and `Exit` (prompts before stopping a running bot).
+- **Graceful stop**: Clicking `Stop` creates `stop.request` and waits up to 15 seconds for `bot.py` to shut down cleanly; if it does not exit in time, the full process tree is force-killed (`taskkill /PID ... /T /F`).
+- **Auto-restart & `yt-dlp` updates**: Restarts automatically with backoff (`10s` → `30s` → `60s` → max `5m`, resetting after `10m` of stable running). Never restarts on fatal exit code `1` or after a user `Stop`. Updates `yt-dlp` at most once per 24 hours (non-fatal).
+- **Autostart shortcuts**: Run `.\create_shortcuts.ps1` in PowerShell to create Desktop and Startup (`shell:startup`) shortcuts to `.venv\Scripts\pythonw.exe tray_app.pyw`. If you previously used `start_bot_hidden.vbs`, delete its old shortcut from `shell:startup`.
 
-1. Runs `.venv\Scripts\python.exe -m pip install -U --timeout 30 --disable-pip-version-check yt-dlp` once at startup (logging to `bot.update.log`). If the update fails or times out, it continues with the installed version.
-2. Starts `.venv\Scripts\python.exe bot.py` in a loop, redirecting console output to `bot.console.log` (keeping the previous run in `bot.console.prev.log`). `bot.py` holds a single-instance lock (`bot.lock`) so a second launch exits immediately instead of causing Telegram `Conflict` errors.
-3. If `bot.py` exits with fatal code `1` (missing/invalid token, unwritable temp folder, or another instance already running), `start_bot.bat` stops instead of restarting forever. Otherwise, it waits 10 seconds and restarts automatically.
+### Fallback batch scripts
+
+`start_bot.bat`, `stop_bot.bat`, and `start_bot_hidden.vbs` remain in the repo as a fallback:
+
+1. `start_bot_hidden.vbs` launches `start_bot.bat` with no visible window.
+2. `start_bot.bat` updates `yt-dlp` once at startup, then runs `bot.py` in a 10-second restart loop (stopping on exit code `1`).
+3. `stop_bot.bat` terminates the `start_bot.bat` loop and the full `bot.py` process tree.
 
 ### Logs
 
 - `bot.log`: Main rotating application log (1 MB per file, up to 5 backups: `bot.log.1` .. `bot.log.5`).
-- `bot.update.log`: Output from the startup `yt-dlp` update.
-- `bot.console.log` / `bot.console.prev.log`: Console stdout/stderr from `start_bot.bat`.
-
-### Stopping the hidden bot
-
-Run `stop_bot.bat` (double-click it in Explorer or run `.\stop_bot.bat` in PowerShell). It terminates the `start_bot.bat` restart loop and the full `bot.py` process tree (including the `.venv` shim and its child `python.exe`).
+- `tray.log`: Rotating tray controller log (`tray.log.1` .. `tray.log.3`).
+- `bot.update.log`: Output from the `yt-dlp` update.
+- `bot.console.log` / `bot.console.prev.log`: Console stdout/stderr from `bot.py` (rotated on each start).
 
 ## 6. Using the bot
 
@@ -168,12 +173,16 @@ Expected result: `yt-dlp` updates to the latest version.
 
 ```text
 bot.py                  Entry point (main, build_application)
+tray_app.pyw            Windows system-tray controller UI (pythonw.exe)
 tgbot/                  Telegram bot package (handlers, flows, preview, state, settings, texts, links, workers, telegram_io)
+tgbot_tray/             Tray controller backend (process supervisor, log rotation, single-instance IPC)
 downloaders/            Media probing & downloading (ytdlp, tiktok, probe, browser, streaminfo, guardproxy, common)
-tests/smoke_test.py     Offline smoke tests
-start_bot.bat           Windows restart loop + yt-dlp auto-update
-stop_bot.bat            Stops the start_bot.bat loop and bot.py process tree
-start_bot_hidden.vbs    Hidden launcher for start_bot.bat
+tests/smoke_test.py     Offline bot smoke tests
+tests/test_tray_controller.py  Offline tray controller & graceful stop tests
+create_shortcuts.ps1    Creates Desktop and Startup shortcuts for tray_app.pyw
+start_bot.bat           Fallback Windows restart loop + yt-dlp auto-update
+stop_bot.bat            Fallback script to stop start_bot.bat and bot.py
+start_bot_hidden.vbs    Fallback hidden launcher for start_bot.bat
 requirements.txt        Python dependencies
 ```
 

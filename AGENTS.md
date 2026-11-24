@@ -9,7 +9,7 @@ user's home network, the bot token, and Telegram's upload limits.
 - Once a task is complete and the code has been tested (including `python tests/smoke_test.py`), make a commit.
 - Before committing, run `git status` and `git diff` to see what has changed. Review uncommitted changes using the `ponytail-review` skill. Fix all identified bugs and risks, then double-check. Other findings (Speed, Lean) should simply be reported; do not address them without my permission.
 - Use `git add <filename>` only for files related to that task. Avoid `git add .`.
-- NEVER commit `config.py`, `.env`, cookie files, `bot.log`, `.venv/`, or `temp_downloads/`.
+- NEVER commit `config.py`, `.env`, cookie files, `bot.log`, `tray.log*`, `tray_settings.json`, `tray.lock`, `tray.ipc`, `stop.request`, `.venv/`, or `temp_downloads/`.
 - Commit messages must follow the Conventional Commits format: `type(section): description`
   - type: feat, fix, docs, refactor, perf, test, chore
   - section (optional): module name, e.g., tiktok, ytdlp, browser
@@ -47,9 +47,12 @@ Platforms and runtime:
   scraper fallback), Instagram (optional cookie file), X/Twitter, YouTube.
   Any other public http(s) link is `generic`.
 - Audio-only results (e.g. SoundCloud) are sent with `send_audio`.
-- The bot runs on the owner's **Windows home PC**, started hidden at logon by
-  `start_bot_hidden.vbs`, which runs `start_bot.bat`. That script restarts the
-  bot in a loop and logs console/update output to `bot.console.log` / `bot.update.log`
+- The bot runs on the owner's **Windows home PC**, managed for daily use by
+  `tray_app.pyw` (`.venv\Scripts\pythonw.exe`, autostarted via Startup
+  shortcut from `create_shortcuts.ps1`), with `start_bot_hidden.vbs` /
+  `start_bot.bat` / `stop_bot.bat` kept as a fallback. The tray controller
+  rotates `bot.console.log` -> `bot.console.prev.log`, logs `yt-dlp` updates
+  to `bot.update.log`, and writes its own rotating log to `tray.log`
   (`bot.py` writes rotating application logs to `bot.log`).
 - The browser uses the built-in **Microsoft Edge** (`channel="msedge"`),
   headless, with no visible window.
