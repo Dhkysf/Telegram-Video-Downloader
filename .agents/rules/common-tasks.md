@@ -21,8 +21,4 @@ description: "Recipes: add a platform, fix yt-dlp breakage, new config option"
   `MAX_CAPTURE_SECONDS` + analysis budget + slot wait.
 - **New config option:** read it in `load_settings()` with a safe default,
   add it to `Settings`, log it (never secrets), and document it in this file.
-- **Editing `start_bot.bat` / `start_bot_hidden.vbs`:** keep CRLF line
-  endings, keep `cd /d "%~dp0"`, and keep the restart loop. Wait with
-  `ping -n 11 127.0.0.1 >nul`, not `timeout`, because `timeout` fails in a
-  hidden window.
 

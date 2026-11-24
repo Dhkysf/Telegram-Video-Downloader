@@ -63,7 +63,7 @@ def configure_logging() -> None:
 
     Logs always go to a size-rotated ``bot.log``. They are also echoed to the
     console when running in a terminal; when stderr is redirected (as by
-    start_bot.bat), the echo is skipped so the redirect target stays small.
+    tray_app.pyw), the echo is skipped so the redirect target stays small.
     """
     handlers: list[logging.Handler] = []
     try:

@@ -49,11 +49,11 @@ Platforms and runtime:
 - Audio-only results (e.g. SoundCloud) are sent with `send_audio`.
 - The bot runs on the owner's **Windows home PC**, managed for daily use by
   `tray_app.pyw` (`.venv\Scripts\pythonw.exe`, autostarted via Startup
-  shortcut from `create_shortcuts.ps1`), with `start_bot_hidden.vbs` /
-  `start_bot.bat` / `stop_bot.bat` kept as a fallback. The tray controller
-  rotates `bot.console.log` -> `bot.console.prev.log`, logs `yt-dlp` updates
-  to `bot.update.log`, and writes its own rotating log to `tray.log`
-  (`bot.py` writes rotating application logs to `bot.log`).
+  shortcut from `create_shortcuts.ps1`; `.venv\Scripts\python.exe bot.py` is
+  the manual console fallback). The tray controller rotates `bot.console.log`
+  -> `bot.console.prev.log`, logs `yt-dlp` updates to `bot.update.log`, and
+  writes its own rotating log to `tray.log` (`bot.py` writes rotating
+  application logs to `bot.log`).
 - The browser uses the built-in **Microsoft Edge** (`channel="msedge"`),
   headless, with no visible window.
 - Single process. No database. In-memory state only, plus temp files.

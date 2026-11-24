@@ -40,9 +40,8 @@ downloaders/            Everything that touches the network for media. Never imp
                         segments/DRM/live, flag ads, rank candidates.
   guardproxy.py         Local HTTP/CONNECT proxy; all browser traffic goes through it.
 requirements.txt        PTB ~=22.5, yt-dlp >= recent, requests ~=2.32, playwright ~=1.65, pystray >= 0.19, Pillow >= 10.0.
-create_shortcuts.ps1    Creates Desktop + Startup shortcuts for tray_app.pyw.
-start_bot.bat           Fallback Windows restart loop (CRLF line endings!).
-start_bot_hidden.vbs    Fallback: runs start_bot.bat with no window (CRLF line endings!).
+assets/app.ico          Application icon for tray_app.pyw and shortcuts.
+create_shortcuts.ps1    Creates project-folder, Desktop, and Startup shortcuts for tray_app.pyw.
 .gitignore              Ignores config.py, .env, instagram_cookies.txt, temp_downloads/, ...
 ```
 
