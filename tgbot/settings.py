@@ -132,6 +132,7 @@ def instance_lock(path: Path = LOCK_FILE) -> Iterator[bool]:
         logger.error("Another instance of the bot is already running (%s); exiting", path.name)
         yield False
         return
+    pid_path = path.with_suffix(".pid")
     try:
         try:
             handle.seek(0)
@@ -140,8 +141,16 @@ def instance_lock(path: Path = LOCK_FILE) -> Iterator[bool]:
             handle.flush()
         except OSError:
             pass
+        try:
+            pid_path.write_text(f"{os.getpid()}\n", encoding="ascii")
+        except OSError:
+            pass
         yield True
     finally:
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         try:
             _unlock_file(handle)
         except OSError:

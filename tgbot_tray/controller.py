@@ -8,6 +8,7 @@ from enum import Enum
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import subprocess
@@ -30,6 +31,19 @@ WIN_BOT_FLAGS = (
 )
 
 logger = logging.getLogger("tray_app.controller")
+
+_BOT_CMD_RE = re.compile(r'(?:^|[\s"\'/\\])bot\.py(?:$|[\s"\'])', re.IGNORECASE)
+
+
+def _cmdline_has_bot_py(cmdline: str) -> bool:
+    """Return True if ``cmdline`` references ``bot.py`` as a token/path."""
+    return bool(_BOT_CMD_RE.search(cmdline))
+
+
+def _is_python_exe_name(name: str) -> bool:
+    """Return True if ``name`` is a Windows Python executable basename."""
+    lower = name.lower()
+    return lower.startswith("python") and lower.endswith(".exe")
 
 
 class BotStatus(str, Enum):
@@ -64,8 +78,8 @@ def format_uptime(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def _kill_tree_win32(pid: int) -> None:
-    """Terminate ``pid`` and all its descendants using Win32 Toolhelp32."""
+def _win32_list_processes() -> list[tuple[int, int, str]]:
+    """Return ``[(pid, parent_pid, exe_name), ...]`` using Win32 Toolhelp32."""
     import ctypes
     from ctypes import wintypes
 
@@ -83,21 +97,106 @@ def _kill_tree_win32(pid: int) -> None:
             ("szExeFile", wintypes.WCHAR * 260),
         ]
 
-    k32 = ctypes.windll.kernel32
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32FirstW.restype = wintypes.BOOL
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+
     snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
-    if snap == wintypes.HANDLE(-1).value:
-        return
-    children: dict[int, list[int]] = {}
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return []
+    result: list[tuple[int, int, str]] = []
     try:
         pe = PROCESSENTRY32W()
         pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
         if k32.Process32FirstW(snap, ctypes.byref(pe)):
             while True:
-                children.setdefault(pe.th32ParentProcessID, []).append(pe.th32ProcessID)
+                result.append((pe.th32ProcessID, pe.th32ParentProcessID, pe.szExeFile))
                 if not k32.Process32NextW(snap, ctypes.byref(pe)):
                     break
     finally:
         k32.CloseHandle(snap)
+    return result
+
+
+def _win32_query_process(pid: int) -> Optional[tuple[str, str]]:
+    """Return ``(exe_path, cmdline)`` for a live Windows process, or None."""
+    import ctypes
+    from ctypes import wintypes
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", ctypes.c_void_p),
+        ]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.GetExitCodeProcess.restype = wintypes.BOOL
+    k32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    ntdll.NtQueryInformationProcess.argtypes = [
+        wintypes.HANDLE,
+        wintypes.ULONG,
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    ntdll.NtQueryInformationProcess.restype = wintypes.LONG
+
+    handle = k32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return None
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
+            return None
+
+        buf = ctypes.create_unicode_buffer(4096)
+        sz = wintypes.DWORD(4096)
+        exe_path = buf.value if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(sz)) else ""
+
+        ret_len = wintypes.ULONG(0)
+        ntdll.NtQueryInformationProcess(handle, 60, None, 0, ctypes.byref(ret_len))
+        cmdline = ""
+        if ret_len.value > 0:
+            raw = ctypes.create_string_buffer(ret_len.value)
+            status = ntdll.NtQueryInformationProcess(
+                handle, 60, raw, ret_len.value, ctypes.byref(ret_len)
+            )
+            if status == 0:
+                us = UNICODE_STRING.from_buffer(raw)
+                if us.Buffer and us.Length:
+                    cmdline = ctypes.wstring_at(us.Buffer, us.Length // 2)
+        return exe_path, cmdline
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _kill_tree_win32(pid: int) -> None:
+    """Terminate ``pid`` and all its descendants using Win32 Toolhelp32."""
+    import ctypes
+    from ctypes import wintypes
+
+    children: dict[int, list[int]] = {}
+    for proc_pid, parent_pid, _name in _win32_list_processes():
+        children.setdefault(parent_pid, []).append(proc_pid)
 
     tree: list[int] = []
     visited: set[int] = set()
@@ -109,6 +208,14 @@ def _kill_tree_win32(pid: int) -> None:
         visited.add(cur)
         tree.append(cur)
         stack.extend(children.get(cur, ()))
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.TerminateProcess.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
 
     for target_pid in reversed(tree):
         handle = k32.OpenProcess(0x0001, False, target_pid)
@@ -624,6 +731,15 @@ def _is_lock_held(lock_path: Path) -> bool:
     return False
 
 
+def _read_pid_file(pid_path: Path) -> Optional[int]:
+    """Read a positive integer PID from ``pid_path``, or return None."""
+    try:
+        pid = int(pid_path.read_text(encoding="ascii").strip())
+        return pid if pid > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
 def stop_standalone_bot(
     project_root: Path = PROJECT_ROOT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
@@ -634,9 +750,11 @@ def stop_standalone_bot(
     """
     root = Path(project_root).resolve()
     lock_path = root / "bot.lock"
+    pid_path = root / "bot.pid"
     stop_file = root / "stop.request"
     if not _is_lock_held(lock_path):
         stop_file.unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
         return False
 
     try:
@@ -652,24 +770,65 @@ def stop_standalone_bot(
         time.sleep(0.15)
 
     if os.name == "nt":
-        ps_cmd = (
-            f"$dir = '{str(root).replace(chr(39), chr(39)*2)}'; "
-            "Get-CimInstance Win32_Process | Where-Object { "
-            "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
-            "$_.CommandLine -like '*bot.py*' -and "
-            "($_.CommandLine.IndexOf($dir, [StringComparison]::OrdinalIgnoreCase) -ge 0) "
-            "} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-        )
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                creationflags=WIN_NO_WINDOW,
+        self_pid = os.getpid()
+        killed_pids: list[int] = []
+
+        pid = _read_pid_file(pid_path)
+        if pid is not None and pid != self_pid:
+            info = _win32_query_process(pid)
+            if info is not None and _cmdline_has_bot_py(info[1]):
+                _kill_tree(pid, logger)
+                killed_pids.append(pid)
+            else:
+                logger.info("Ignoring stale or non-bot PID %d from %s", pid, pid_path.name)
+
+        if not killed_pids:
+            root_norm = os.path.normcase(os.path.realpath(str(root)))
+            root_prefix = root_norm.rstrip("\\/") + os.sep
+            procs = _win32_list_processes()
+
+            direct_pids: set[int] = set()
+            for p_pid, _ppid, name in procs:
+                if p_pid == self_pid or not _is_python_exe_name(name):
+                    continue
+                info = _win32_query_process(p_pid)
+                if info is None:
+                    continue
+                exe, cmd = info
+                if not _cmdline_has_bot_py(cmd):
+                    continue
+                exe_norm = os.path.normcase(os.path.realpath(exe)) if exe else ""
+                cmd_norm = os.path.normcase(cmd.replace("/", "\\"))
+                if exe_norm.startswith(root_prefix) or root_prefix in cmd_norm:
+                    direct_pids.add(p_pid)
+
+            child_pids = [
+                p_pid
+                for p_pid, ppid, name in procs
+                if p_pid != self_pid
+                and p_pid not in direct_pids
+                and _is_python_exe_name(name)
+                and ppid in direct_pids
+            ]
+
+            for target_pid in [*child_pids, *sorted(direct_pids)]:
+                if _win32_query_process(target_pid) is not None:
+                    _kill_tree(target_pid, logger)
+                    killed_pids.append(target_pid)
+
+        if killed_pids:
+            logger.info(
+                "Force-killed standalone bot process tree(s); PIDs: %s",
+                ", ".join(str(p) for p in killed_pids),
             )
-        except Exception:
-            pass
+            release_deadline = time.monotonic() + 2.0
+            while time.monotonic() < release_deadline:
+                if not _is_lock_held(lock_path):
+                    break
+                time.sleep(0.05)
+
     stop_file.unlink(missing_ok=True)
-    return True
+    if not _is_lock_held(lock_path):
+        pid_path.unlink(missing_ok=True)
+        return True
+    return False
