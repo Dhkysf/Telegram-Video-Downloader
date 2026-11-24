@@ -18,6 +18,7 @@ user's home network, the bot token, and Telegram's upload limits.
 - One commit per type of change. Do not combine new features and bug fixes in a single commit.
 - If a commit is rejected by the pre-commit hook, fix the issue and try again. Do not use `--no-verify`.
 - DO NOT `git push` unless I ask you to.
+- If `git add`/`git commit` fails in the sandbox (Permission denied on `.git/index.lock`), repeat the same command outside the sandbox. Please do not submit the commit command to me.
 - At the end of your response, include a summary of the review results: what was fixed and what was intentionally left as is.
 
 
