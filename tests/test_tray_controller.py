@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import io
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -349,11 +353,11 @@ class TrayControllerTests(unittest.TestCase):
         tray_app = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tray_app)
 
-        spawned: list[tuple[list[str], str]] = []
+        spawned: list[tuple[list[str], str, dict[str, str]]] = []
         errors: list[tuple[str, str]] = []
 
         def fake_popen(cmd, cwd=None, env=None):
-            spawned.append((list(cmd), str(cwd)))
+            spawned.append((list(cmd), str(cwd), dict(env or {})))
             return None
 
         # 1. Already in project venv -> no spawn.
@@ -364,7 +368,7 @@ class TrayControllerTests(unittest.TestCase):
             popen_fn=fake_popen,
             show_error_fn=lambda t, m: errors.append((t, m)),
         )
-        self.assertEqual(res, "ok")
+        self.assertIsNone(res)
         self.assertEqual(spawned, [])
 
         # 2. Outside venv, pythonw.exe missing -> error dialog, no spawn.
@@ -375,7 +379,7 @@ class TrayControllerTests(unittest.TestCase):
             popen_fn=fake_popen,
             show_error_fn=lambda t, m: errors.append((t, m)),
         )
-        self.assertEqual(res, "missing_venv")
+        self.assertEqual(res, 1)
         self.assertEqual(len(errors), 1)
         self.assertIn("python -m venv .venv", errors[0][1])
         self.assertIn("pip install -r requirements.txt", errors[0][1])
@@ -393,13 +397,110 @@ class TrayControllerTests(unittest.TestCase):
             popen_fn=fake_popen,
             show_error_fn=lambda t, m: errors.append((t, m)),
         )
-        self.assertEqual(res, "relaunched")
+        self.assertEqual(res, 0)
         self.assertEqual(len(spawned), 1)
         self.assertEqual(
             spawned[0][0],
             [str(pythonw.resolve()), str(script.resolve()), "--hidden", "--start"],
         )
         self.assertEqual(spawned[0][1], str(self.root.resolve()))
+        self.assertEqual(spawned[0][2].get("TVB_RELAUNCHED"), "1")
+
+    def test_ensure_venv_cli_wait_and_relaunch_guard(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("tray_app", PROJECT_ROOT / "tray_app.pyw")
+        assert spec is not None and spec.loader is not None
+        tray_app = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tray_app)
+
+        scripts_dir = self.root / ".venv" / "Scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        python_exe = scripts_dir / "python.exe"
+        pythonw_exe = scripts_dir / "pythonw.exe"
+        python_exe.write_text("", encoding="ascii")
+        pythonw_exe.write_text("", encoding="ascii")
+        script = self.root / "tray_app.pyw"
+
+        # Case-insensitive venv path check.
+        upper_venv = Path(str(self.root / ".VENV").upper())
+        self.assertTrue(tray_app.is_in_project_venv(self.root, prefix=upper_venv))
+
+        # --stop uses python.exe and subprocess.run(..., timeout=60), returning child's exit code.
+        with (
+            patch.object(tray_app.subprocess, "Popen") as mock_popen,
+            patch.object(
+                tray_app.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(args=[], returncode=0),
+            ) as mock_run,
+        ):
+            rc = tray_app.ensure_venv(
+                ["--stop"],
+                project_root=self.root,
+                script_path=script,
+                prefix=self.root / "sys_python",
+            )
+        self.assertEqual(rc, 0)
+        mock_popen.assert_not_called()
+        mock_run.assert_called_once()
+        run_args, run_kwargs = mock_run.call_args
+        self.assertEqual(
+            run_args[0],
+            [str(python_exe.resolve()), str(script.resolve()), "--stop"],
+        )
+        self.assertEqual(run_kwargs["timeout"], 60)
+        self.assertEqual(run_kwargs["env"].get("TVB_RELAUNCHED"), "1")
+
+        # --selftest propagates non-zero exit code.
+        with patch.object(
+            tray_app.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=2),
+        ):
+            rc = tray_app.ensure_venv(
+                ["--selftest"],
+                project_root=self.root,
+                script_path=script,
+                prefix=self.root / "sys_python",
+            )
+        self.assertEqual(rc, 2)
+
+        # TimeoutExpired -> returns 1 and writes a message to stderr.
+        stderr_buf = io.StringIO()
+        with (
+            patch.object(
+                tray_app.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(cmd="python.exe", timeout=60),
+            ),
+            patch.object(tray_app.sys, "stderr", stderr_buf),
+        ):
+            rc = tray_app.ensure_venv(
+                ["--stop"],
+                project_root=self.root,
+                script_path=script,
+                prefix=self.root / "sys_python",
+            )
+        self.assertEqual(rc, 1)
+        self.assertIn("Timed out", stderr_buf.getvalue())
+
+        # TVB_RELAUNCHED=1 prevents relaunch loop for both GUI and CLI.
+        with (
+            patch.dict(os.environ, {"TVB_RELAUNCHED": "1"}),
+            patch.object(tray_app.subprocess, "Popen") as mock_popen,
+            patch.object(tray_app.subprocess, "run") as mock_run,
+        ):
+            self.assertIsNone(
+                tray_app.ensure_venv([], project_root=self.root, prefix=self.root / "sys_python")
+            )
+            self.assertIsNone(
+                tray_app.ensure_venv(
+                    ["--stop"], project_root=self.root, prefix=self.root / "sys_python"
+                )
+            )
+            mock_popen.assert_not_called()
+            mock_run.assert_not_called()
 
     def test_stop_standalone_bot(self) -> None:
         # No bot.lock -> returns False.
@@ -425,6 +526,194 @@ class TrayControllerTests(unittest.TestCase):
         self.assertTrue(stop_standalone_bot(self.root, stop_timeout=3.0))
         self.assertTrue(released.wait(timeout=2.0))
         self.assertFalse(stop_file.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree test")
+    def test_stop_standalone_bot_relative_shim_tree_via_pid(self) -> None:
+        bot_py = self.root / "bot.py"
+        bot_py.write_text(
+            "import subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "from tgbot.settings import instance_lock\n"
+            "root = Path('.').resolve()\n"
+            "with instance_lock(root / 'bot.lock') as ok:\n"
+            "    assert ok\n"
+            "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "    (root / 'grandchild.pid').write_text(str(child.pid), encoding='ascii')\n"
+            "    time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        shim_py = self.root / "shim.py"
+        shim_py.write_text(
+            "import subprocess, sys\n"
+            "p = subprocess.Popen([sys.executable, 'bot.py'])\n"
+            "( __import__('pathlib').Path('bot_child.pid') ).write_text(str(p.pid), encoding='ascii')\n"
+            "p.wait()\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PROJECT_ROOT)
+        shim_proc = subprocess.Popen(
+            [sys.executable, str(shim_py)],
+            cwd=str(self.root),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        bot_pid: int | None = None
+        grandchild_pid: int | None = None
+        try:
+            self.assertTrue(_wait_until(lambda: (self.root / "bot.pid").is_file()))
+            self.assertTrue(_wait_until(lambda: (self.root / "grandchild.pid").is_file()))
+            bot_pid = int((self.root / "bot.pid").read_text(encoding="ascii").strip())
+            grandchild_pid = int((self.root / "grandchild.pid").read_text(encoding="ascii").strip())
+            self.assertTrue(_is_pid_alive(shim_proc.pid))
+            self.assertTrue(_is_pid_alive(bot_pid))
+            self.assertTrue(_is_pid_alive(grandchild_pid))
+
+            self.assertTrue(stop_standalone_bot(self.root, stop_timeout=0.3))
+            self.assertTrue(_wait_until(lambda: not _is_pid_alive(bot_pid), timeout=3.0))
+            self.assertTrue(_wait_until(lambda: not _is_pid_alive(grandchild_pid), timeout=3.0))
+            self.assertTrue(_wait_until(lambda: shim_proc.poll() is not None, timeout=3.0))
+            self.assertFalse((self.root / "bot.pid").exists())
+            self.assertFalse((self.root / "stop.request").exists())
+        finally:
+            for pid in (grandchild_pid, bot_pid, shim_proc.pid):
+                if pid is not None and _is_pid_alive(pid):
+                    _kill_tree_win32(pid)
+            try:
+                shim_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @unittest.skipUnless(
+        os.name == "nt"
+        and (PROJECT_ROOT / ".venv" / "Scripts" / "python.exe").is_file()
+        and (PROJECT_ROOT / ".venv" / "pyvenv.cfg").is_file(),
+        "Windows venv shim test",
+    )
+    def test_stop_standalone_bot_fallback_relative_venv_shim_no_pid(self) -> None:
+        venv_scripts = self.root / ".venv" / "Scripts"
+        venv_scripts.mkdir(parents=True)
+        venv_python = venv_scripts / "python.exe"
+        shutil.copy2(PROJECT_ROOT / ".venv" / "Scripts" / "python.exe", venv_python)
+        shutil.copy2(PROJECT_ROOT / ".venv" / "pyvenv.cfg", self.root / ".venv" / "pyvenv.cfg")
+
+        (self.root / "bot.py").write_text(
+            "import msvcrt, os, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "root = Path('.').resolve()\n"
+            "fh = open(root / 'bot.lock', 'a+b')\n"
+            "fh.seek(0); msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "(root / 'grandchild.pid').write_text(str(child.pid), encoding='ascii')\n"
+            "(root / 'real.pid').write_text(str(os.getpid()), encoding='ascii')\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        shim_proc = subprocess.Popen(
+            [r".venv\Scripts\python.exe", "bot.py"],
+            executable=str(venv_python),
+            cwd=str(self.root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        real_pid: int | None = None
+        grandchild_pid: int | None = None
+        try:
+            self.assertTrue(_wait_until(lambda: (self.root / "real.pid").is_file()))
+            self.assertTrue(_wait_until(lambda: (self.root / "grandchild.pid").is_file()))
+            real_pid = int((self.root / "real.pid").read_text(encoding="ascii").strip())
+            grandchild_pid = int((self.root / "grandchild.pid").read_text(encoding="ascii").strip())
+            self.assertNotEqual(shim_proc.pid, real_pid)
+            self.assertFalse((self.root / "bot.pid").exists())
+            self.assertTrue(_is_pid_alive(real_pid))
+            self.assertTrue(_is_pid_alive(grandchild_pid))
+
+            self.assertTrue(stop_standalone_bot(self.root, stop_timeout=0.3))
+            self.assertTrue(_wait_until(lambda: not _is_pid_alive(real_pid), timeout=3.0))
+            self.assertTrue(_wait_until(lambda: not _is_pid_alive(grandchild_pid), timeout=3.0))
+            self.assertTrue(_wait_until(lambda: shim_proc.poll() is not None, timeout=3.0))
+        finally:
+            for pid in (grandchild_pid, real_pid, shim_proc.pid):
+                if pid is not None and _is_pid_alive(pid):
+                    _kill_tree_win32(pid)
+            try:
+                shim_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree test")
+    def test_stop_standalone_bot_ignores_stale_pid_without_bot_py(self) -> None:
+        innocent = subprocess.Popen(
+            [sys.executable, "-c", "import os, time; print(os.getpid(), flush=True); time.sleep(60)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        assert innocent.stdout is not None
+        innocent_real_pid = int(innocent.stdout.readline().strip())
+        lock_file = self.root / "bot.lock"
+        handle = open(lock_file, "a+b")
+        _lock_file(handle)
+        (self.root / "bot.pid").write_text(f"{innocent_real_pid}\n", encoding="ascii")
+        try:
+            self.assertFalse(stop_standalone_bot(self.root, stop_timeout=0.2))
+            self.assertTrue(_is_pid_alive(innocent_real_pid))
+            self.assertIsNone(innocent.poll())
+        finally:
+            try:
+                _unlock_file(handle)
+            except OSError:
+                pass
+            handle.close()
+            if _is_pid_alive(innocent_real_pid):
+                _kill_tree_win32(innocent_real_pid)
+            if _is_pid_alive(innocent.pid):
+                _kill_tree_win32(innocent.pid)
+            try:
+                innocent.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree test")
+    def test_stop_standalone_bot_never_kills_bot_in_other_folder(self) -> None:
+        other_root = self.root.parent / f"{self.root.name}_other"
+        other_root.mkdir(parents=True, exist_ok=True)
+        other_bot = other_root / "bot.py"
+        other_bot.write_text(
+            "import os, time; print(os.getpid(), flush=True); time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        other_proc = subprocess.Popen(
+            [sys.executable, str(other_bot)],
+            cwd=str(other_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        assert other_proc.stdout is not None
+        other_real_pid = int(other_proc.stdout.readline().strip())
+        handle = open(self.root / "bot.lock", "a+b")
+        _lock_file(handle)
+        try:
+            self.assertFalse(stop_standalone_bot(self.root, stop_timeout=0.2))
+            self.assertTrue(_is_pid_alive(other_real_pid))
+            self.assertIsNone(other_proc.poll())
+        finally:
+            try:
+                _unlock_file(handle)
+            except OSError:
+                pass
+            handle.close()
+            if _is_pid_alive(other_real_pid):
+                _kill_tree_win32(other_real_pid)
+            if _is_pid_alive(other_proc.pid):
+                _kill_tree_win32(other_proc.pid)
+            try:
+                other_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            shutil.rmtree(other_root, ignore_errors=True)
 
     def test_app_icon_sizes(self) -> None:
         from PIL import Image
