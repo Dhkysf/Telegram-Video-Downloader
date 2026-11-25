@@ -49,7 +49,9 @@ class BotState:
     active_users: set[int] = field(default_factory=set)
     pending: dict[str, PendingChoice] = field(default_factory=dict)
     probe_cache: dict[ProbeCacheKey, tuple[float, ProbeResult]] = field(default_factory=dict)
-    in_flight_probes: dict[ProbeCacheKey, asyncio.Future[ProbeResult]] = field(default_factory=dict)
+    in_flight_probes: dict[ProbeCacheKey, tuple[asyncio.Future[ProbeResult], asyncio.Event]] = field(
+        default_factory=dict
+    )
     started_at: float = field(default_factory=time.monotonic)
     jobs_ok: int = 0
     jobs_failed: int = 0

@@ -137,8 +137,46 @@ async def process_download(
         )
 
 
+async def _try_edit_status(status: Optional[Message], text: str) -> None:
+    """Edit a status message, ignoring any TelegramError so probes are not aborted."""
+    try:
+        await safe_edit(status, text)
+    except TelegramError as exc:
+        logger.info("Could not update status message (%s); continuing", type(exc).__name__)
+
+
+async def _await_inflight_probe(
+    future: asyncio.Future[ProbeResult],
+    browser_started: asyncio.Event,
+    status: Optional[Message],
+) -> ProbeResult:
+    """Await a shared in-flight probe, updating status if it falls back to browser."""
+    if not future.done():
+        if browser_started.is_set():
+            await _try_edit_status(status, BROWSER_TEXT)
+        else:
+            event_task = asyncio.create_task(browser_started.wait())
+            try:
+                await asyncio.wait((future, event_task), return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                if not event_task.done():
+                    event_task.cancel()
+                    try:
+                        await event_task
+                    except asyncio.CancelledError:
+                        pass
+            if not future.done() and browser_started.is_set():
+                await _try_edit_status(status, BROWSER_TEXT)
+    return await asyncio.shield(future)
+
+
 async def probe_link(
-    url: str, platform: str, state: BotState, status: Optional[Message], force_browser: bool
+    url: str,
+    platform: str,
+    state: BotState,
+    status: Optional[Message],
+    force_browser: bool,
+    on_browser: Optional[asyncio.Event] = None,
 ) -> ProbeResult:
     """Check a link: yt-dlp first, then (for generic sites) a headless browser."""
     if force_browser and not state.settings.browser_fallback:
@@ -146,22 +184,25 @@ async def probe_link(
     timeout_result = ProbeResult(ErrorCode.TIMEOUT, detail="probe timeout")
     error_result = ProbeResult(ErrorCode.UNKNOWN, detail="probe worker raised")
     first: Optional[ProbeResult] = None
-    async with state.semaphore:
-        if not force_browser:
+    if not force_browser:
+        async with state.semaphore:
             event = threading.Event()
             first = await run_worker(
                 probe_ytdlp, url, platform, event,
                 cancel_event=event, timeout=PROBE_TIMEOUT, on_timeout=timeout_result, on_error=error_result,
             )
-            if not (state.settings.browser_fallback and should_try_browser(platform, first)):
-                return first
-            logger.info("yt-dlp found nothing (%s); trying headless browser", first.error.name)
-            await safe_edit(status, BROWSER_TEXT)
-        event = threading.Event()
-        second = await run_worker(
-            probe_with_browser, url, event,
-            cancel_event=event, timeout=BROWSER_PROBE_TIMEOUT, on_timeout=timeout_result, on_error=error_result,
-        )
+        if not (state.settings.browser_fallback and should_try_browser(platform, first)):
+            return first
+        logger.info("yt-dlp found nothing (%s); trying headless browser", first.error.name)
+        if on_browser is not None:
+            on_browser.set()
+        await _try_edit_status(status, BROWSER_TEXT)
+    # Browser has its own _browser_slots (MAX_BROWSERS=1); do not hold state.semaphore here.
+    event = threading.Event()
+    second = await run_worker(
+        probe_with_browser, url, event,
+        cancel_event=event, timeout=BROWSER_PROBE_TIMEOUT, on_timeout=timeout_result, on_error=error_result,
+    )
     if second.error is ErrorCode.OK or first is None:
         return second
     # Neither found a video: report the more informative error.
@@ -199,16 +240,21 @@ async def check_link(
         else:
             inflight = state.in_flight_probes.get(key)
             if inflight is not None:
-                probe = await asyncio.shield(inflight)
+                future, browser_started = inflight
+                probe = await _await_inflight_probe(future, browser_started, status)
             else:
                 future: asyncio.Future[ProbeResult] = asyncio.get_running_loop().create_future()
-                state.in_flight_probes[key] = future
+                browser_started = asyncio.Event()
+                entry = (future, browser_started)
+                state.in_flight_probes[key] = entry
                 probe_result: Optional[ProbeResult] = None
                 try:
-                    probe_result = await probe_link(url, platform, state, status, force_browser)
+                    probe_result = await probe_link(
+                        url, platform, state, status, force_browser, on_browser=browser_started
+                    )
                     _cache_put(state, key, probe_result)
                 finally:
-                    if state.in_flight_probes.get(key) is future:
+                    if state.in_flight_probes.get(key) is entry:
                         state.in_flight_probes.pop(key, None)
                     if not future.done():
                         future.set_result(
