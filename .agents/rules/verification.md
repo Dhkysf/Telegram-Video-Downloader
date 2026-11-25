@@ -81,5 +81,6 @@ Telegram API without a token).
      (`GuardProxy.blocked` increases).
 6. **Token leak test:** run
    `TELEGRAM_BOT_TOKEN=123456:FAKEtoken... python bot.py` and grep the output
-   for the fake token. The count must be 0, and the exit code must be 1.
+   for the fake token. The count must be 0, the exit code must be 1, and
+   `bot.ready` must not exist.
 

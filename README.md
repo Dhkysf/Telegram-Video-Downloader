@@ -104,7 +104,8 @@ Double-click `Telegram Video Bot.lnk` (or `tray_app.pyw`), or run:
 
 Expected result: The tray controller opens (or re-launches itself inside `.venv` if started with system Python) and places an icon in the Windows system tray.
 
-- **Icon colours**: **Green** = `Running`, **Yellow** = `Restarting`, **Red** = `Stopped` or `Crashed`.
+- **Icon colours**: **Blue** (`#229ED9`) = `Running`, **Yellow** (`#F1C40F`) = `Starting`, `Restarting`, or `Stopping`, **Red** (`#E74C3C`) = `Stopped` or `Crashed`. (Windows may cache the old shortcut icon in `assets/app.ico` until you sign out or restart.)
+- **Startup readiness (`bot.ready`)**: During the daily `yt-dlp` update and Telegram login, the tray stays yellow (`Starting`). Once `bot.py` connects to Telegram, it writes `bot.ready` with its PID and the tray switches to blue (`Running`).
 - **Window & tray**: Minimizing or closing (`X`) hides the window to the system tray. Double-click the tray icon (or select **Show**) to restore it.
 - **Tray menu items**: `Show`, `Start`, `Stop`, `Restart`, `Open log`, `Open folder`, `Start bot when app opens` (saved in `tray_settings.json`), and `Exit`.
 - **Autostart at login**: `create_shortcuts.ps1` puts a shortcut in Windows Startup with `--hidden --start` so the bot starts in the background when you sign in.
@@ -118,6 +119,7 @@ Expected result: The tray controller opens (or re-launches itself inside `.venv`
 - `--start`: Automatically start `bot.py` on launch.
 - `--stop`: Stop the running bot (via tray IPC or standalone `stop.request`) and exit.
 - `--selftest`: Verify tray imports, icon generation, and `assets/app.ico`, then exit.
+- `--regen-icon`: Regenerate `assets/app.ico` in Telegram blue and exit.
 
 ### Manual console fallback
 
@@ -137,6 +139,7 @@ Expected result: The bot starts polling Telegram and writes logs to `bot.log` (a
 | `tray.log` | Size-rotated log for `tray_app.pyw`. | Yes (when stopped) |
 | `tray_settings.json` | Stores the `Start bot when app opens` preference. | Yes (resets preference) |
 | `bot.pid`, `bot.lock` | Tracks the running `bot.py` PID and prevents duplicate bots. | Only if stale after a crash |
+| `bot.ready` | Readiness marker written by `bot.py` after Telegram login so the tray knows when `Starting` becomes `Running`. | Yes (when stopped) |
 | `tray.lock`, `tray.ipc` | Prevents duplicate tray instances and handles `SHOW` IPC. | Only if stale after a crash |
 | `stop.request` | Temporary signal file created during graceful stop. | Yes (when stopped) |
 
@@ -178,6 +181,7 @@ Never share `instagram_cookies.txt` or commit it to git.
 
 - **Tray window does not appear**: Check the Windows system tray overflow (`^` arrow) for the icon, or run `.venv\Scripts\python.exe tray_app.pyw` in PowerShell to see any startup error.
 - **Tray icon is red**: Check `bot.log` and `bot.console.log` (or click **Open log**). Exit code `1` usually means a missing/invalid `TELEGRAM_BOT_TOKEN`.
+- **Tray icon stays yellow**: The bot is still updating `yt-dlp` or waiting to connect to Telegram (check `bot.update.log` and `bot.log` if it stays yellow past 2 minutes).
 - **`Conflict` error in `bot.log`**: Another instance of `bot.py` is already polling with the same token. Stop the other instance (or run `.venv\Scripts\python.exe tray_app.pyw --stop`).
 - **FFmpeg / Edge / Playwright missing**: Install FFmpeg with `winget install Gyan.FFmpeg` (or set `FFMPEG_DIR`), ensure Microsoft Edge is installed, and verify `.venv\Scripts\python -m pip install -r requirements.txt`.
 - **Bot is silent**: Check `ALLOWED_USER_IDS` in `config.py` or your environment—if set, only listed user IDs receive replies.

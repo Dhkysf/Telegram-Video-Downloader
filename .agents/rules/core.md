@@ -46,7 +46,7 @@ create_shortcuts.ps1    Creates project-folder, Desktop, and Startup shortcuts f
 ```
 
 Not in git, but present at runtime: `config.py` (token), `instagram_cookies.txt`,
-`temp_downloads/`, `bot.log`, `.venv/`.
+`temp_downloads/`, `bot.log`, `bot.ready`, `.venv/`.
 
 ## Setup and run
 
