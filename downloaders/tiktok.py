@@ -7,6 +7,7 @@ This module never raises to its caller: every outcome is a DownloadResult.
 
 from __future__ import annotations
 
+import errno
 import html
 import logging
 import re
@@ -238,6 +239,10 @@ def _stream_to_file(
         return final_path
     except requests.RequestException as exc:
         raise _ScrapeError(ErrorCode.NETWORK, f"download interrupted: {type(exc).__name__}") from exc
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC or getattr(exc, "winerror", None) in (39, 112):
+            raise _ScrapeError(ErrorCode.DISK_FULL, f"disk full: {exc}") from exc
+        raise
     finally:
         response.close()
 

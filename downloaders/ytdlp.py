@@ -81,6 +81,7 @@ NETWORK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FORMAT_UNAVAILABLE_PATTERN = re.compile(r"requested format is not available", re.IGNORECASE)
+DISK_FULL_PATTERN = re.compile(r"no space left on device|errno 28|disk full|not enough space", re.IGNORECASE)
 FFMPEG_PATTERN = re.compile(r"ffmpeg|ffprobe|postprocessing", re.IGNORECASE)
 BLOCKED_PATTERN = re.compile(re.escape(BLOCKED_ADDRESS_MESSAGE), re.IGNORECASE)
 DRM_PATTERN = re.compile(r"\bdrm\b", re.IGNORECASE)
@@ -223,6 +224,8 @@ def classify_error(message: str) -> ErrorCode:
         return ErrorCode.PRIVATE_OR_LOGIN
     if UNSUPPORTED_PATTERN.search(message):
         return ErrorCode.UNSUPPORTED
+    if DISK_FULL_PATTERN.search(message):
+        return ErrorCode.DISK_FULL
     if FFMPEG_PATTERN.search(message):
         return ErrorCode.UNKNOWN  # e.g. "ffmpeg not found" must not become NOT_FOUND.
     if NOT_FOUND_PATTERN.search(message):
@@ -681,7 +684,7 @@ def get_tiktok(url: str, job_id: str, cancel_event: Optional[threading.Event] = 
     (the scraper serves the same file) and TIMEOUT (the job was cancelled).
     """
     result = download_with_ytdlp(url, job_id, "tiktok", cancel_event)
-    if result.error in (ErrorCode.OK, ErrorCode.TOO_LARGE, ErrorCode.TIMEOUT):
+    if result.error in (ErrorCode.OK, ErrorCode.TOO_LARGE, ErrorCode.TIMEOUT, ErrorCode.DISK_FULL):
         return result
     if cancel_event is not None and cancel_event.is_set():
         return DownloadResult(None, ErrorCode.TIMEOUT, "cancelled before fallback")

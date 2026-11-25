@@ -33,6 +33,7 @@ INSTAGRAM_COOKIES_FILE: Path = PROJECT_ROOT / "instagram_cookies.txt"
 # --- Size limits ---------------------------------------------------------------
 MAX_FILE_SIZE_MB: int = 50  # Telegram Bot API upload limit for bots.
 MAX_FILE_SIZE_BYTES: int = MAX_FILE_SIZE_MB * 1024 * 1024
+MIN_FREE_DISK_BYTES: int = 3 * MAX_FILE_SIZE_BYTES
 DEFAULT_MAX_HEIGHT: int = 720  # Default video resolution cap (pixels).
 
 # --- Network -------------------------------------------------------------------
@@ -58,6 +59,7 @@ class ErrorCode(Enum):
     NETWORK = "network"
     TIMEOUT = "timeout"
     LIVE = "live"
+    DISK_FULL = "disk_full"
     UNKNOWN = "unknown"
 
 
@@ -420,6 +422,17 @@ def prepare_temp_dir() -> int:
     return clear_temp_dir()
 
 
+def free_disk_bytes(path: Path = TEMP_DIR) -> Optional[int]:
+    """Return free disk space in bytes for ``path``, or None if unknown. Never raises."""
+    try:
+        target = path if path.exists() else path.parent
+        if not target.exists():
+            target = PROJECT_ROOT
+        return shutil.disk_usage(target).free
+    except OSError:
+        return None
+
+
 def runtime_info() -> dict[str, Any]:
     """Collect versions, tool availability, temp stats and free disk space.
 
@@ -474,12 +487,7 @@ def runtime_info() -> dict[str, Any]:
     except OSError:
         pass
 
-    disk_free_bytes: Optional[int] = None
-    try:
-        target = TEMP_DIR if TEMP_DIR.exists() else PROJECT_ROOT
-        disk_free_bytes = shutil.disk_usage(target).free
-    except OSError:
-        pass
+    disk_free_bytes = free_disk_bytes(TEMP_DIR)
 
     return {
         "yt_dlp_version": yt_dlp_version,

@@ -64,5 +64,9 @@ ERROR_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.NETWORK: "📡 Ada masalah koneksi atau proses terlalu lama. Silakan coba lagi.",
     ErrorCode.TIMEOUT: "📡 Ada masalah koneksi atau proses terlalu lama. Silakan coba lagi.",
     ErrorCode.LIVE: "🔴 Ini siaran langsung (live), jadi belum bisa diunduh. Coba lagi setelah siarannya selesai.",
+    ErrorCode.DISK_FULL: (
+        "💾 Penyimpanan di PC bot hampir penuh, jadi unduhan dibatalkan. "
+        "Kosongkan sedikit ruang disk lalu coba lagi."
+    ),
     ErrorCode.UNKNOWN: "⚠️ Maaf, video gagal diproses. Silakan coba lagi nanti.",
 }

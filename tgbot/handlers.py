@@ -13,7 +13,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 from telegram.ext import ContextTypes
 
-from downloaders import MediaCandidate, browser_available, runtime_info
+from downloaders import MIN_FREE_DISK_BYTES, MediaCandidate, browser_available, runtime_info
 from tgbot.flows import check_link, process_download
 from tgbot.links import detect_platform, extract_first_url
 from tgbot.preview import finish_preview
@@ -100,7 +100,12 @@ def build_health_text(state: BotState, info: dict[str, Any]) -> str:
         temp_str = "?"
 
     disk_free = info.get("disk_free_bytes")
-    disk_str = f"{disk_free / (1024 ** 3):.1f} GB" if isinstance(disk_free, int) else "?"
+    if isinstance(disk_free, int):
+        disk_str = f"{disk_free / (1024 ** 3):.1f} GB"
+        disk_warn = " ⚠️" if disk_free < MIN_FREE_DISK_BYTES else ""
+    else:
+        disk_str = "?"
+        disk_warn = ""
 
     return "\n".join([
         "🩺 <b>Status Bot</b>",
@@ -110,7 +115,7 @@ def build_health_text(state: BotState, info: dict[str, Any]) -> str:
         f"🗂 Menunggu konfirmasi: <b>{live_pending}</b> · cache info: <b>{live_cache}</b>",
         f"🔧 FFmpeg: <b>{esc(ffmpeg_str)}</b> · Browser: <b>{esc(browser_str)}</b> · Konfirmasi: <b>{esc(confirm_str)}</b>",
         f"📦 Versi: PTB <code>{esc(PTB_VERSION)}</code> · yt-dlp <code>{esc(info.get('yt_dlp_version') or '?')}</code> · Playwright <code>{esc(pw_str)}</code>",
-        f"💾 Folder sementara: <code>{esc(temp_str)}</code> · sisa disk: <code>{esc(disk_str)}</code>",
+        f"💾 Folder sementara: <code>{esc(temp_str)}</code> · sisa disk: <code>{esc(disk_str)}</code>{disk_warn}",
     ])
 
 

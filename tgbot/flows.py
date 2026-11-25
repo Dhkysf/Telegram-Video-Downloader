@@ -14,10 +14,13 @@ from telegram.ext import ContextTypes
 
 from downloaders import (
     MAX_FILE_SIZE_BYTES,
+    MIN_FREE_DISK_BYTES,
+    TEMP_DIR,
     DownloadResult,
     ErrorCode,
     ProbeResult,
     cleanup_job,
+    free_disk_bytes,
     new_job_id,
     probe_with_browser,
     probe_ytdlp,
@@ -76,6 +79,20 @@ async def process_download(
         job_id, user_id, platform, site, "audio" if audio else "video",
     )
     try:
+        free_bytes = await asyncio.to_thread(free_disk_bytes, TEMP_DIR)
+        if free_bytes is not None and free_bytes < MIN_FREE_DISK_BYTES:
+            outcome = ErrorCode.DISK_FULL
+            logger.warning(
+                "Job %s aborted: low disk space (%.1f MB free < %d MB required)",
+                job_id, free_bytes / (1024 * 1024), MIN_FREE_DISK_BYTES // (1024 * 1024),
+            )
+            msg = ERROR_MESSAGES[ErrorCode.DISK_FULL]
+            if status is None:
+                await tg_call(lambda: message.reply_text(msg), "disk full")
+            else:
+                await safe_edit(status, msg)
+            return
+
         if status is None:
             status = await tg_call(lambda: message.reply_text(status_text), "status")
         else:
