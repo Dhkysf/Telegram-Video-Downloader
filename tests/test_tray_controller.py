@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import io
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -21,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tgbot.settings import clear_stop_request, watch_stop_request
+from tgbot.settings import clear_ready_file, clear_stop_request, watch_stop_request, write_ready_file
 from tgbot_tray.controller import (
     BotController,
     BotStatus,
@@ -45,6 +46,7 @@ from pathlib import Path
 mode = os.environ.get("FAKE_MODE", "sleep")
 root = Path(os.environ.get("FAKE_ROOT", ".")).resolve()
 stop_file = root / "stop.request"
+ready_file = root / "bot.ready"
 count_file = root / "runs.txt"
 
 with open(count_file, "a", encoding="utf-8") as fh:
@@ -58,14 +60,53 @@ if mode == "exit1":
 elif mode == "exit2":
     sys.exit(2)
 elif mode == "graceful":
+    ready_file.write_text(f"{os.getpid()}\\n", encoding="ascii")
     for _ in range(200):
         if stop_file.exists():
             stop_file.unlink(missing_ok=True)
+            ready_file.unlink(missing_ok=True)
             print("graceful_exit", flush=True)
             sys.exit(0)
         time.sleep(0.05)
     sys.exit(0)
+elif mode == "delayed_ready":
+    allow_file = root / "allow.ready"
+    for _ in range(200):
+        if stop_file.exists():
+            stop_file.unlink(missing_ok=True)
+            sys.exit(0)
+        if allow_file.exists():
+            ready_file.write_text(f"{os.getpid()}\\n", encoding="ascii")
+            break
+        time.sleep(0.05)
+    for _ in range(200):
+        if stop_file.exists():
+            stop_file.unlink(missing_ok=True)
+            ready_file.unlink(missing_ok=True)
+            sys.exit(0)
+        time.sleep(0.05)
+    sys.exit(0)
+elif mode == "never_ready":
+    for _ in range(200):
+        if stop_file.exists():
+            stop_file.unlink(missing_ok=True)
+            sys.exit(0)
+        time.sleep(0.05)
+    sys.exit(0)
+elif mode == "fail_then_ready":
+    runs = len(count_file.read_text(encoding="utf-8").splitlines())
+    if runs == 1:
+        sys.exit(2)
+    ready_file.write_text(f"{os.getpid()}\\n", encoding="ascii")
+    for _ in range(200):
+        if stop_file.exists():
+            stop_file.unlink(missing_ok=True)
+            ready_file.unlink(missing_ok=True)
+            sys.exit(0)
+        time.sleep(0.05)
+    sys.exit(0)
 elif mode == "spawn_and_ignore":
+    ready_file.write_text(f"{os.getpid()}\\n", encoding="ascii")
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
         stdout=subprocess.DEVNULL,
@@ -190,7 +231,7 @@ class TrayControllerTests(unittest.TestCase):
         def on_change(snap: ControllerSnapshot) -> None:
             if snap.status == BotStatus.RESTARTING and snap.next_restart_at is not None:
                 recorded_delays.append(round(snap.next_restart_at - now[0], 2))
-            elif snap.status == BotStatus.RUNNING and len(recorded_delays) == 5:
+            elif snap.status == BotStatus.STARTING and snap.pid is not None and len(recorded_delays) == 5:
                 # Simulate a 700s stable run during the 6th run so backoff resets.
                 now[0] += 700.0
 
@@ -335,15 +376,16 @@ class TrayControllerTests(unittest.TestCase):
         spec.loader.exec_module(tray_app)
 
         for argv, expected in [
-            ([], (False, False, False, False)),
-            (["--hidden"], (True, False, False, False)),
-            (["--start"], (False, True, False, False)),
-            (["--hidden", "--start"], (True, True, False, False)),
-            (["--stop"], (False, False, True, False)),
-            (["--selftest"], (False, False, False, True)),
+            ([], (False, False, False, False, False)),
+            (["--hidden"], (True, False, False, False, False)),
+            (["--start"], (False, True, False, False, False)),
+            (["--hidden", "--start"], (True, True, False, False, False)),
+            (["--stop"], (False, False, True, False, False)),
+            (["--selftest"], (False, False, False, True, False)),
+            (["--regen-icon"], (False, False, False, False, True)),
         ]:
             ns = tray_app.parse_args(argv)
-            self.assertEqual((ns.hidden, ns.start, ns.stop, ns.selftest), expected)
+            self.assertEqual((ns.hidden, ns.start, ns.stop, ns.selftest, ns.regen_icon), expected)
 
     def test_venv_relaunch_decision(self) -> None:
         import importlib.util
@@ -723,6 +765,246 @@ class TrayControllerTests(unittest.TestCase):
         with Image.open(ico_path) as img:
             self.assertEqual(img.format, "ICO")
             self.assertEqual(img.info.get("sizes"), {(16, 16), (32, 32), (48, 48), (256, 256)})
+            rgba = img.convert("RGBA")
+            cx, cy = rgba.width // 2, rgba.height // 2
+            self.assertEqual(rgba.getpixel((cx, cy))[:3], (34, 158, 217))
+
+    def test_starting_until_ready_and_stale_ready_ignored(self) -> None:
+        os.environ["FAKE_MODE"] = "delayed_ready"
+        (self.root / "bot.ready").write_text("999999\n", encoding="ascii")
+        ctrl = self._make_controller(stop_timeout=3.0)
+        self.addCleanup(lambda: ctrl.stop(wait=True))
+
+        ctrl.start()
+        self.assertTrue(_wait_until(lambda: ctrl.snapshot().status == BotStatus.STARTING and ctrl.snapshot().pid is not None))
+        self.assertFalse((self.root / "bot.ready").exists())
+
+        # A live unrelated PID (this test process) must not mark the bot as running.
+        (self.root / "bot.ready").write_text(f"{os.getpid()}\n", encoding="ascii")
+        time.sleep(0.25)
+        self.assertEqual(ctrl.snapshot().status, BotStatus.STARTING)
+
+        (self.root / "allow.ready").write_text("go\n", encoding="ascii")
+        self.assertTrue(_wait_until(lambda: ctrl.snapshot().status == BotStatus.RUNNING))
+        ctrl.stop(wait=True)
+        self.assertEqual(ctrl.snapshot().status, BotStatus.STOPPED)
+
+    def test_never_ready_stays_starting_and_warns_once(self) -> None:
+        os.environ["FAKE_MODE"] = "never_ready"
+        warnings: list[str] = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                if record.levelno >= logging.WARNING:
+                    warnings.append(record.getMessage())
+
+        test_logger = logging.getLogger("test_never_ready")
+        test_logger.setLevel(logging.WARNING)
+        test_logger.propagate = False
+        handler = _ListHandler()
+        test_logger.addHandler(handler)
+        self.addCleanup(lambda: test_logger.removeHandler(handler))
+
+        statuses: list[BotStatus] = []
+        ctrl = self._make_controller(
+            ready_timeout=0.2,
+            logger_inst=test_logger,
+            on_state_change=lambda snap: statuses.append(snap.status),
+        )
+        self.addCleanup(lambda: ctrl.stop(wait=True))
+
+        ctrl.start()
+        self.assertTrue(_wait_until(lambda: any("did not report ready" in w for w in warnings), timeout=3.0))
+        time.sleep(0.35)
+        self.assertEqual(ctrl.snapshot().status, BotStatus.STARTING)
+        self.assertEqual(sum(1 for w in warnings if "did not report ready" in w), 1)
+        self.assertEqual(len((self.root / "runs.txt").read_text(encoding="utf-8").splitlines()), 1)
+
+        ctrl.stop(wait=True)
+        self.assertEqual(ctrl.snapshot().status, BotStatus.STOPPED)
+        self.assertIn(BotStatus.STOPPING, statuses)
+        self.assertEqual(statuses[-1], BotStatus.STOPPED)
+
+    def test_crash_during_starting_and_restart_flow(self) -> None:
+        os.environ["FAKE_MODE"] = "fail_then_ready"
+        statuses: list[BotStatus] = []
+        ctrl = self._make_controller(
+            backoff_schedule=(0.1,),
+            on_state_change=lambda snap: statuses.append(snap.status),
+        )
+        self.addCleanup(lambda: ctrl.stop(wait=True))
+
+        ctrl.start()
+        self.assertTrue(_wait_until(lambda: ctrl.snapshot().status == BotStatus.RUNNING, timeout=5.0))
+        ctrl.stop(wait=True)
+        for expected in (BotStatus.STARTING, BotStatus.RESTARTING, BotStatus.RUNNING, BotStatus.STOPPING, BotStatus.STOPPED):
+            self.assertIn(expected, statuses)
+
+    def test_stop_emits_stopping_then_stopped(self) -> None:
+        os.environ["FAKE_MODE"] = "graceful"
+        statuses: list[BotStatus] = []
+        ctrl = self._make_controller(
+            stop_timeout=3.0,
+            on_state_change=lambda snap: statuses.append(snap.status),
+        )
+        self.addCleanup(lambda: ctrl.stop(wait=True))
+
+        ctrl.start()
+        self.assertTrue(_wait_until(lambda: ctrl.snapshot().status == BotStatus.RUNNING))
+        ctrl.stop(wait=True)
+        deduped = [s for i, s in enumerate(statuses) if i == 0 or s != statuses[i - 1]]
+        self.assertEqual(
+            deduped,
+            [BotStatus.STARTING, BotStatus.RUNNING, BotStatus.STOPPING, BotStatus.STOPPED],
+        )
+
+    def test_ytdlp_update_uses_starting_status(self) -> None:
+        os.environ["FAKE_MODE"] = "graceful"
+        statuses: list[tuple[BotStatus, str]] = []
+        ctrl = self._make_controller(
+            update_interval_seconds=86400.0,
+            update_command=[sys.executable, "-c", "import time; time.sleep(0.1)"],
+            on_state_change=lambda snap: statuses.append((snap.status, snap.detail)),
+        )
+        self.addCleanup(lambda: ctrl.stop(wait=True))
+
+        ctrl.start()
+        self.assertTrue(_wait_until(lambda: ctrl.snapshot().status == BotStatus.RUNNING))
+        ctrl.stop(wait=True)
+        self.assertIn((BotStatus.STARTING, "Updating yt-dlp..."), statuses)
+        self.assertNotIn(BotStatus.RESTARTING, [s for s, _ in statuses])
+
+    def test_write_and_clear_ready_file_bot_side(self) -> None:
+        ready_file = self.root / "bot.ready"
+        self.assertFalse(clear_ready_file(ready_file))
+        write_ready_file(ready_file)
+        self.assertEqual(ready_file.read_text(encoding="ascii").strip(), str(os.getpid()))
+        self.assertTrue(clear_ready_file(ready_file))
+        self.assertFalse(ready_file.exists())
+        self.assertFalse(clear_ready_file(ready_file))
+
+    def test_status_colors_covers_every_bot_status(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("tray_app", PROJECT_ROOT / "tray_app.pyw")
+        assert spec is not None and spec.loader is not None
+        tray_app = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tray_app)
+
+        self.assertEqual(set(tray_app.STATUS_COLORS), set(BotStatus))
+        self.assertEqual(tray_app.STATUS_COLORS[BotStatus.RUNNING], "#229ED9")
+        self.assertEqual(tray_app.STATUS_COLORS[BotStatus.STOPPED], "#E74C3C")
+        self.assertEqual(tray_app.STATUS_COLORS[BotStatus.CRASHED], "#E74C3C")
+        for s in (BotStatus.STARTING, BotStatus.RESTARTING, BotStatus.STOPPING):
+            self.assertEqual(tray_app.STATUS_COLORS[s], "#F1C40F")
+
+    def test_tray_icon_sync_with_fake_icon(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("tray_app", PROJECT_ROOT / "tray_app.pyw")
+        assert spec is not None and spec.loader is not None
+        tray_app = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tray_app)
+
+        class FakeIcon:
+            def __init__(self, name, icon, title, menu) -> None:
+                self.name = name
+                self._icon = icon
+                self._icon_handle = icon
+                self._title = title
+                self.menu = menu
+                self._visible = False
+                self.displayed_icon = None
+                self.displayed_title = None
+
+            @property
+            def visible(self) -> bool:
+                return self._visible
+
+            @visible.setter
+            def visible(self, value: bool) -> None:
+                if value and not self._visible:
+                    # Mirrors pystray: _show() uses cached _icon_handle, reads current _title.
+                    self.displayed_icon = self._icon_handle
+                    self.displayed_title = self._title
+                    self._visible = True
+                elif not value:
+                    self._visible = False
+
+            @property
+            def icon(self):
+                return self._icon
+
+            @icon.setter
+            def icon(self, value) -> None:
+                self._icon = value
+                if self._visible:
+                    self._icon_handle = value
+                    self.displayed_icon = value
+
+            @property
+            def title(self) -> str:
+                return self._title
+
+            @title.setter
+            def title(self, value: str) -> None:
+                self._title = value
+                if self._visible:
+                    self.displayed_title = value
+
+            def update_menu(self) -> None:
+                pass
+
+        fake_icon_holder: list[FakeIcon] = []
+
+        def _make_fake(self_app):
+            ic = FakeIcon(
+                "telegram_video_bot",
+                self_app._icons[tray_app.STATUS_COLORS[BotStatus.STOPPED]],
+                f"Telegram Video Bot - {BotStatus.STOPPED.value}",
+                None,
+            )
+            fake_icon_holder.append(ic)
+            return ic
+
+        with patch.object(tray_app.TrayApp, "_build_tray_icon", _make_fake):
+            app = tray_app.TrayApp(selftest=False, start_hidden=True)
+        app.root.withdraw()
+        self.addCleanup(lambda: (setattr(app, "_closing", True), app.root.destroy()))
+
+        fake_icon = fake_icon_holder[0]
+
+        # 1. Status changes before _on_icon_ready: icon is not visible yet, so _shown_icon_key stays None.
+        app._apply_snapshot(ControllerSnapshot(BotStatus.RUNNING, 123, 1.0, None, None))
+        self.assertIsNone(app._shown_icon_key)
+        self.assertIsNone(fake_icon.displayed_icon)
+
+        # Setup callback runs -> visible becomes True -> _sync_icon runs on Tk thread.
+        app._on_icon_ready(fake_icon)
+        app.root.update()
+        self.assertEqual(app._shown_icon_key, BotStatus.RUNNING)
+        self.assertEqual(tray_app.STATUS_COLORS[app._shown_icon_key], "#229ED9")
+        self.assertIs(fake_icon.displayed_icon, app._icons["#229ED9"])
+        self.assertEqual(fake_icon.displayed_title, "Telegram Video Bot - Running")
+
+        # 2. Status changes after visible -> updated immediately, including same-colour tooltip changes.
+        app._apply_snapshot(ControllerSnapshot(BotStatus.STOPPING, 123, 1.0, None, None))
+        self.assertEqual(app._shown_icon_key, BotStatus.STOPPING)
+        self.assertIs(fake_icon.displayed_icon, app._icons["#F1C40F"])
+        self.assertEqual(fake_icon.displayed_title, "Telegram Video Bot - Stopping")
+
+        app._apply_snapshot(ControllerSnapshot(BotStatus.RESTARTING, None, None, 2, 10.0))
+        self.assertEqual(app._shown_icon_key, BotStatus.RESTARTING)
+        self.assertEqual(fake_icon.displayed_title, "Telegram Video Bot - Restarting")
+
+        # 3. _tick heals a forced mismatch.
+        app._apply_snapshot(ControllerSnapshot(BotStatus.RUNNING, 123, 1.0, None, None))
+        app._shown_icon_key = BotStatus.STOPPED
+        fake_icon.displayed_icon = app._icons["#E74C3C"]
+        with patch.object(app.root, "after", lambda *_a, **_kw: None):
+            app._tick()
+        self.assertEqual(app._shown_icon_key, BotStatus.RUNNING)
+        self.assertIs(fake_icon.displayed_icon, app._icons["#229ED9"])
 
 
 if __name__ == "__main__":
