@@ -17,6 +17,7 @@ bot.console*.log
 bot.update.log
 bot.lock
 bot.pid
+bot.ready
 stop.request
 tray.log*
 tray_settings.json

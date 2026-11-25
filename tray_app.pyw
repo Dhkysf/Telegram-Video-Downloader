@@ -39,10 +39,12 @@ RELAUNCH_ENV_VAR = "TVB_RELAUNCHED"
 RELAUNCH_CLI_TIMEOUT = 60
 
 STATUS_COLORS: dict[BotStatus, str] = {
-    BotStatus.RUNNING: "#2ecc71",
-    BotStatus.STOPPED: "#e74c3c",
-    BotStatus.CRASHED: "#e74c3c",
-    BotStatus.RESTARTING: "#f1c40f",
+    BotStatus.RUNNING: "#229ED9",
+    BotStatus.STARTING: "#F1C40F",
+    BotStatus.RESTARTING: "#F1C40F",
+    BotStatus.STOPPING: "#F1C40F",
+    BotStatus.STOPPED: "#E74C3C",
+    BotStatus.CRASHED: "#E74C3C",
 }
 
 logger = logging.getLogger("tray_app")
@@ -83,7 +85,7 @@ def ensure_venv(
     if is_in_project_venv(project_root, prefix) or os.environ.get(RELAUNCH_ENV_VAR):
         return None
 
-    cli_mode = any(arg in ("--stop", "--selftest") for arg in argv)
+    cli_mode = any(arg in ("--stop", "--selftest", "--regen-icon") for arg in argv)
     exe_name = "python.exe" if cli_mode else "pythonw.exe"
     root = Path(project_root).resolve()
     venv_exe = (root / ".venv" / "Scripts" / exe_name).resolve()
@@ -190,16 +192,16 @@ def make_tray_icon(color_hex: str) -> "Image.Image":
     return image
 
 
-def ensure_app_icon(path: Path = APP_ICON_FILE) -> Path:
-    """Create ``assets/app.ico`` (16/32/48/256 px) if it does not already exist."""
-    if path.is_file():
+def ensure_app_icon(path: Path = APP_ICON_FILE, *, force: bool = False) -> Path:
+    """Create ``assets/app.ico`` (16/32/48/256 px) if missing or ``force=True``."""
+    if path.is_file() and not force:
         return path
     from PIL import Image, ImageDraw
 
     path.parent.mkdir(parents=True, exist_ok=True)
     image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.ellipse((24, 24, 232, 232), fill="#2ecc71", outline="#1f2937", width=16)
+    draw.ellipse((24, 24, 232, 232), fill=STATUS_COLORS[BotStatus.RUNNING], outline="#1f2937", width=16)
     image.save(path, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (256, 256)])
     return path
 
@@ -265,7 +267,9 @@ class TrayApp:
             highlightthickness=0,
             bd=0,
         )
-        self._dot_id = self._dot_canvas.create_oval(2, 2, 12, 12, fill="#e74c3c", outline="")
+        self._dot_id = self._dot_canvas.create_oval(
+            2, 2, 12, 12, fill=STATUS_COLORS[BotStatus.STOPPED], outline=""
+        )
         self._dot_canvas.pack(side="left", padx=(0, 8))
 
         self._status_var = tk.StringVar(value="Stopped")
@@ -340,7 +344,7 @@ class TrayApp:
         return pystray.Icon(
             "telegram_video_bot",
             self._icons[STATUS_COLORS[BotStatus.STOPPED]],
-            "Telegram Video Bot - Stopped",
+            f"Telegram Video Bot - {BotStatus.STOPPED.value}",
             menu,
         )
 
@@ -374,7 +378,11 @@ class TrayApp:
     def _can_stop(self) -> bool:
         if self._action_busy:
             return False
-        return self.controller.snapshot().status in (BotStatus.RUNNING, BotStatus.RESTARTING)
+        return self.controller.snapshot().status in (
+            BotStatus.STARTING,
+            BotStatus.RUNNING,
+            BotStatus.RESTARTING,
+        )
 
     def _on_icon_ready(self, icon: "pystray.Icon") -> None:
         if self._closing:
@@ -504,7 +512,7 @@ class TrayApp:
         if self._closing:
             return
         snap = self.controller.snapshot()
-        if snap.status in (BotStatus.RUNNING, BotStatus.RESTARTING):
+        if snap.status in (BotStatus.STARTING, BotStatus.RUNNING, BotStatus.RESTARTING):
             self.show_window()
             if not messagebox.askyesno(
                 "Exit",
@@ -578,6 +586,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Build the UI objects and exit 0 without starting the bot.",
     )
+    parser.add_argument(
+        "--regen-icon",
+        action="store_true",
+        help="Regenerate assets/app.ico and exit 0.",
+    )
     return parser.parse_args(argv)
 
 
@@ -589,6 +602,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return exit_code
 
     args = parse_args(raw_argv)
+
+    if args.regen_icon:
+        ensure_app_icon(force=True)
+        return 0
 
     if args.selftest:
         app = TrayApp(selftest=True)

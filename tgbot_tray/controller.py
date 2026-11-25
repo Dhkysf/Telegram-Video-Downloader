@@ -18,6 +18,7 @@ from typing import BinaryIO, Callable, Optional
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 DEFAULT_STOP_TIMEOUT = 15.0
+DEFAULT_READY_TIMEOUT = 120.0
 DEFAULT_BACKOFF_SECONDS: tuple[float, ...] = (10.0, 30.0, 60.0, 300.0)
 DEFAULT_STABLE_RUN_SECONDS = 600.0
 DEFAULT_UPDATE_INTERVAL_SECONDS = 86400.0
@@ -49,7 +50,9 @@ def _is_python_exe_name(name: str) -> bool:
 class BotStatus(str, Enum):
     """Lifecycle states shown by the tray UI."""
 
+    STARTING = "Starting"
     RUNNING = "Running"
+    STOPPING = "Stopping"
     STOPPED = "Stopped"
     RESTARTING = "Restarting"
     CRASHED = "Crashed"
@@ -189,6 +192,24 @@ def _win32_query_process(pid: int) -> Optional[tuple[str, str]]:
         k32.CloseHandle(handle)
 
 
+def _is_descendant_pid_win32(candidate_pid: int, ancestor_pid: int) -> bool:
+    """Return True if ``candidate_pid`` is ``ancestor_pid`` or a descendant of it."""
+    if candidate_pid == ancestor_pid:
+        return True
+    parent_map = {pid: ppid for pid, ppid, _name in _win32_list_processes()}
+    cur = candidate_pid
+    visited: set[int] = set()
+    while cur > 0 and cur not in visited:
+        visited.add(cur)
+        parent = parent_map.get(cur)
+        if parent is None or parent <= 0 or parent == cur:
+            return False
+        if parent == ancestor_pid:
+            return True
+        cur = parent
+    return False
+
+
 def _kill_tree_win32(pid: int) -> None:
     """Terminate ``pid`` and all its descendants using Win32 Toolhelp32."""
     import ctypes
@@ -288,6 +309,7 @@ class BotController:
         python_exe: Optional[Path] = None,
         bot_script: Optional[Path] = None,
         stop_timeout: float = DEFAULT_STOP_TIMEOUT,
+        ready_timeout: float = DEFAULT_READY_TIMEOUT,
         backoff_schedule: tuple[float, ...] = DEFAULT_BACKOFF_SECONDS,
         stable_run_seconds: float = DEFAULT_STABLE_RUN_SECONDS,
         update_interval_seconds: float = DEFAULT_UPDATE_INTERVAL_SECONDS,
@@ -309,6 +331,7 @@ class BotController:
             else (self.project_root / "bot.py").resolve()
         )
         self.stop_timeout = stop_timeout
+        self.ready_timeout = ready_timeout
         self.backoff_schedule = backoff_schedule or DEFAULT_BACKOFF_SECONDS
         self.stable_run_seconds = stable_run_seconds
         self.update_interval_seconds = update_interval_seconds
@@ -333,6 +356,8 @@ class BotController:
         self._log = logger_inst or logger
 
         self.stop_request_file = self.project_root / "stop.request"
+        self.ready_file = self.project_root / "bot.ready"
+        self.pid_file = self.project_root / "bot.pid"
         self.console_log = self.project_root / "bot.console.log"
         self.console_prev_log = self.project_root / "bot.console.prev.log"
         self.update_log = self.project_root / "bot.update.log"
@@ -341,6 +366,7 @@ class BotController:
         self._action_lock = threading.Lock()
         self._wake_event = threading.Event()
         self._stop_requested = False
+        self._suppress_stopped = False
         self._supervisor: Optional[threading.Thread] = None
         self._last_update_at: Optional[float] = None
         self._snapshot = ControllerSnapshot(
@@ -369,14 +395,17 @@ class BotController:
     def restart(self) -> None:
         """Stop the running bot (if any) and start a fresh run."""
         with self._action_lock:
-            self._stop_locked(wait=True)
-            self._start_locked()
+            self._stop_locked(wait=True, suppress_stopped=True)
+            if not self._start_locked():
+                with self._lock:
+                    self._suppress_stopped = False
 
     def _start_locked(self) -> bool:
         with self._lock:
             if self._supervisor is not None and self._supervisor.is_alive():
                 return False
             self._stop_requested = False
+            self._suppress_stopped = False
             self._wake_event.clear()
             thread = threading.Thread(
                 target=self._run_loop,
@@ -387,13 +416,31 @@ class BotController:
             thread.start()
             return True
 
-    def _stop_locked(self, wait: bool) -> None:
+    def _stop_locked(self, wait: bool, *, suppress_stopped: bool = False) -> None:
         with self._lock:
+            self._suppress_stopped = suppress_stopped
             self._stop_requested = True
             self._wake_event.set()
             sup = self._supervisor
         if wait and sup is not None and sup.is_alive() and sup is not threading.current_thread():
             sup.join(timeout=self.stop_timeout + 15.0)
+
+    def _emit_stopped_if_allowed(self, last_exit: Optional[int]) -> None:
+        with self._lock:
+            if self._suppress_stopped:
+                return
+        self._set_snapshot(BotStatus.STOPPED, last_exit_code=last_exit)
+
+    def _is_ready_for_process(self, proc_pid: int) -> bool:
+        ready_pid = _read_pid_file(self.ready_file)
+        if ready_pid is None:
+            return False
+        if ready_pid == proc_pid:
+            return True
+        if os.name == "nt":
+            return _is_descendant_pid_win32(ready_pid, proc_pid)
+        bot_pid = _read_pid_file(self.pid_file)
+        return bot_pid is not None and ready_pid == bot_pid
 
     def _set_snapshot(
         self,
@@ -439,7 +486,7 @@ class BotController:
 
         self._last_update_at = now
         self._set_snapshot(
-            BotStatus.RESTARTING,
+            BotStatus.STARTING,
             last_exit_code=self.snapshot().last_exit_code,
             detail="Updating yt-dlp...",
         )
@@ -470,7 +517,19 @@ class BotController:
 
         deadline = self._monotonic() + DEFAULT_UPDATE_TIMEOUT
         while proc.poll() is None:
-            if self._is_stop_requested() or self._monotonic() >= deadline:
+            if self._is_stop_requested():
+                self._set_snapshot(
+                    BotStatus.STOPPING,
+                    last_exit_code=self.snapshot().last_exit_code,
+                    detail="Stopping...",
+                )
+                _kill_tree(proc.pid, self._log)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+            if self._monotonic() >= deadline:
                 _kill_tree(proc.pid, self._log)
                 try:
                     proc.wait(timeout=5)
@@ -518,6 +577,7 @@ class BotController:
                 pass
         finally:
             self.stop_request_file.unlink(missing_ok=True)
+            self.ready_file.unlink(missing_ok=True)
 
     def _run_loop(self) -> None:
         backoff_index = 0
@@ -526,10 +586,11 @@ class BotController:
         while not self._is_stop_requested():
             self._maybe_update_ytdlp()
             if self._is_stop_requested():
-                self._set_snapshot(BotStatus.STOPPED, last_exit_code=last_exit)
+                self._emit_stopped_if_allowed(last_exit)
                 return
 
             self.stop_request_file.unlink(missing_ok=True)
+            self.ready_file.unlink(missing_ok=True)
             self._rotate_console_log()
 
             try:
@@ -556,34 +617,55 @@ class BotController:
                 log_f.close()
 
             start_mono = self._monotonic()
+            ready_mono: Optional[float] = None
+            is_ready = False
+            warned_not_ready = False
             self._set_snapshot(
-                BotStatus.RUNNING,
+                BotStatus.STARTING,
                 pid=proc.pid,
-                started_at=start_mono,
+                started_at=None,
                 last_exit_code=last_exit,
             )
 
             while proc.poll() is None:
                 if self._is_stop_requested():
                     self._set_snapshot(
-                        BotStatus.RUNNING,
+                        BotStatus.STOPPING,
                         pid=proc.pid,
-                        started_at=start_mono,
+                        started_at=ready_mono,
                         last_exit_code=last_exit,
                         detail="Stopping...",
                     )
                     self._stop_process(proc)
                     break
+                if not is_ready:
+                    if self._is_ready_for_process(proc.pid):
+                        is_ready = True
+                        ready_mono = self._monotonic()
+                        self._set_snapshot(
+                            BotStatus.RUNNING,
+                            pid=proc.pid,
+                            started_at=ready_mono,
+                            last_exit_code=last_exit,
+                        )
+                    elif not warned_not_ready and (self._monotonic() - start_mono) >= self.ready_timeout:
+                        warned_not_ready = True
+                        self._log.warning(
+                            "Bot PID %d did not report ready within %.0fs; still starting",
+                            proc.pid,
+                            self.ready_timeout,
+                        )
                 try:
                     proc.wait(timeout=0.1)
                 except subprocess.TimeoutExpired:
                     pass
 
+            self.ready_file.unlink(missing_ok=True)
             last_exit = proc.returncode
             uptime = self._monotonic() - start_mono
 
             if self._is_stop_requested():
-                self._set_snapshot(BotStatus.STOPPED, last_exit_code=last_exit)
+                self._emit_stopped_if_allowed(last_exit)
                 return
 
             if last_exit == 1:
@@ -608,7 +690,7 @@ class BotController:
             )
             self._wake_event.wait(delay)
 
-        self._set_snapshot(BotStatus.STOPPED, last_exit_code=last_exit)
+        self._emit_stopped_if_allowed(last_exit)
 
 
 class SingleInstance:
@@ -830,5 +912,6 @@ def stop_standalone_bot(
     stop_file.unlink(missing_ok=True)
     if not _is_lock_held(lock_path):
         pid_path.unlink(missing_ok=True)
+        (root / "bot.ready").unlink(missing_ok=True)
         return True
     return False

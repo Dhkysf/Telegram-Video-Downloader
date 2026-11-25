@@ -22,6 +22,7 @@ from downloaders import clear_temp_dir, install_network_guard, prepare_temp_dir
 from tgbot.handlers import error_handler, handle_choice, handle_text, health_command, ping_command, start_command
 from tgbot.settings import (
     Settings,
+    clear_ready_file,
     clear_stop_request,
     configure_ffmpeg,
     configure_logging,
@@ -30,6 +31,7 @@ from tgbot.settings import (
     load_token,
     redact_token_in_logs,
     watch_stop_request,
+    write_ready_file,
 )
 from tgbot.state import BotState
 
@@ -54,10 +56,11 @@ def build_application(token: str, settings: Settings) -> Application:
             ])
         except Exception as exc:
             logger.warning("Could not register bot commands: %s", exc)
-        logger.info("Bot @%s is running (long polling)", application.bot.username)
         application.bot_data["stop_watcher"] = asyncio.create_task(
             watch_stop_request(application.stop_running)
         )
+        write_ready_file()
+        logger.info("Bot @%s is running (long polling)", application.bot.username)
 
     async def post_shutdown(application: Application) -> None:
         watcher = application.bot_data.pop("stop_watcher", None)
@@ -65,6 +68,7 @@ def build_application(token: str, settings: Settings) -> Application:
             watcher.cancel()
             with suppress(asyncio.CancelledError):
                 await watcher
+        clear_ready_file()
         removed = await asyncio.to_thread(clear_temp_dir)
         logger.info("Shutdown complete; removed %d leftover temp file(s)", removed)
 
@@ -115,6 +119,8 @@ def main() -> None:
             logger.info("Removed %d leftover temp file(s) from a previous run", removed)
         if clear_stop_request():
             logger.info("Removed stale stop.request from a previous run")
+        if clear_ready_file():
+            logger.info("Removed stale bot.ready from a previous run")
         # 5. Application + long polling (SIGINT/SIGTERM trigger a graceful stop).
         application = build_application(token, load_settings())
         try:

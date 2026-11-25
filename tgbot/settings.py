@@ -29,6 +29,7 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOG_FILE: Path = PROJECT_ROOT / "bot.log"
 LOCK_FILE: Path = PROJECT_ROOT / "bot.lock"
 STOP_REQUEST_FILE: Path = PROJECT_ROOT / "stop.request"
+READY_FILE: Path = PROJECT_ROOT / "bot.ready"
 LOG_MAX_BYTES = 1024 * 1024  # Rotate at 1 MB...
 LOG_BACKUP_COUNT = 5  # ...keeping bot.log.1 .. bot.log.5 (max ~6 MB total).
 
@@ -160,6 +161,26 @@ def instance_lock(path: Path = LOCK_FILE) -> Iterator[bool]:
 
 def clear_stop_request(path: Path = STOP_REQUEST_FILE) -> bool:
     """Remove ``path`` if it exists; return True if a stop request was present."""
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning("Could not remove %s: %s", path.name, exc)
+        return False
+
+
+def write_ready_file(path: Path = READY_FILE) -> None:
+    """Write the current process PID to ``path`` to signal Telegram readiness."""
+    try:
+        path.write_text(f"{os.getpid()}\n", encoding="ascii")
+    except OSError as exc:
+        logger.warning("Could not write %s: %s", path.name, exc)
+
+
+def clear_ready_file(path: Path = READY_FILE) -> bool:
+    """Remove ``path`` if it exists; return True if a ready marker was present."""
     try:
         path.unlink()
         return True
