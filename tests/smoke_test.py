@@ -1068,6 +1068,172 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
                     bot_mod.main()
                 self.assertEqual(cm.exception.code, expected_code)
 
+    async def test_browser_probe_does_not_hold_download_semaphore(self) -> None:
+        import threading
+        import downloaders.probe
+
+        state = make_state(max_concurrent_downloads=1)
+        fake_bot = FakeBot()
+        ctx = make_context(state, fake_bot)
+        browser_entered = threading.Event()
+        release_browser = threading.Event()
+
+        def fake_browser(_url: str, _cancel: object = None) -> ProbeResult:
+            browser_entered.set()
+            release_browser.wait(timeout=5.0)
+            return ProbeResult(
+                ErrorCode.OK,
+                candidates=[MediaCandidate(url="https://cdn.example.com/v.mp4", duration=20, height=720, via_browser=True)],
+                via_browser=True,
+            )
+
+        def ok_runner(_job_id: str, _cancel: object) -> DownloadResult:
+            out = TEMP_DIR / f"{_job_id}.mp4"
+            out.write_bytes(b"MP4")
+            return DownloadResult(out, ErrorCode.OK)
+
+        with (
+            patch.object(tgbot.flows, "probe_ytdlp", return_value=ProbeResult(ErrorCode.UNSUPPORTED)),
+            patch.object(tgbot.flows, "probe_with_browser", fake_browser),
+            patch.object(downloaders.probe, "browser_available", return_value=True),
+            patch.object(tgbot.preview, "browser_available", return_value=True),
+        ):
+            task_a = asyncio.create_task(
+                tgbot.handlers.handle_text(
+                    Update(1, message=make_message("https://example.com/slow", user_id=100)), ctx
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(browser_entered.wait, 5.0))
+            self.assertEqual(state.semaphore._value, 1)
+
+            await asyncio.wait_for(
+                tgbot.flows.process_download(
+                    ctx, make_message("https://youtube.com/watch?v=dl", user_id=200),
+                    200, "youtube", "YouTube", ok_runner, state,
+                ),
+                timeout=2.0,
+            )
+            self.assertEqual(len(fake_bot.videos), 1)
+            self.assertEqual(state.jobs_ok, 1)
+            self.assertFalse(task_a.done())
+
+            release_browser.set()
+            await asyncio.wait_for(task_a, timeout=2.0)
+            self.assertEqual(len(state.pending), 1)
+            self.assertEqual(next(iter(state.pending.values())).user_id, 100)
+
+            await state.semaphore.acquire()
+            try:
+                forced = await asyncio.wait_for(
+                    tgbot.flows.probe_link("https://example.com/forced", "generic", state, None, force_browser=True),
+                    timeout=2.0,
+                )
+                self.assertEqual(forced.error, ErrorCode.OK)
+            finally:
+                state.semaphore.release()
+
+        self.assertEqual(state.semaphore._value, 1)
+        self.assertEqual(state.in_flight_probes, {})
+        self.assertEqual(state.active_users, set())
+
+    async def test_single_flight_browser_fallback_edit_error_and_waiter_status(self) -> None:
+        import threading
+        import downloaders.probe
+
+        state = make_state(max_concurrent_downloads=2)
+        ctx = make_context(state)
+        ytdlp_entered = threading.Event()
+        release_ytdlp = threading.Event()
+        browser_entered = threading.Event()
+        release_browser = threading.Event()
+        waiter_200_browser = asyncio.Event()
+        waiter_300_browser = asyncio.Event()
+        ytdlp_calls = 0
+        browser_calls = 0
+        owner_edit_attempts = 0
+        statuses: dict[int, FakeSentMessage] = {}
+
+        class TrackingStatus(FakeSentMessage):
+            def __init__(self, uid: int, text: str, **kwargs: object) -> None:
+                super().__init__(text=text, **kwargs)
+                self._uid = uid
+
+            async def edit_text(self, text: str, **kwargs: object) -> FakeSentMessage:
+                nonlocal owner_edit_attempts
+                if self._uid == 100 and text == tgbot.texts.BROWSER_TEXT:
+                    owner_edit_attempts += 1
+                    raise NetworkError("telegram down")
+                res = await super().edit_text(text, **kwargs)
+                if self._uid == 200 and text == tgbot.texts.BROWSER_TEXT:
+                    waiter_200_browser.set()
+                elif self._uid == 300 and text == tgbot.texts.BROWSER_TEXT:
+                    waiter_300_browser.set()
+                return res
+
+        async def tracking_reply_text(msg: Message, text: str, **kwargs: object) -> FakeSentMessage:
+            uid = msg.from_user.id if msg.from_user else 0
+            sent = TrackingStatus(uid, text, **kwargs)
+            if uid in (100, 200, 300) and uid not in statuses:
+                statuses[uid] = sent
+            self.sent.append(sent)
+            return sent
+
+        def fake_ytdlp(*_args: object) -> ProbeResult:
+            nonlocal ytdlp_calls
+            ytdlp_calls += 1
+            ytdlp_entered.set()
+            release_ytdlp.wait(timeout=5.0)
+            return ProbeResult(ErrorCode.UNSUPPORTED)
+
+        def fake_browser(_url: str, _cancel: object = None) -> ProbeResult:
+            nonlocal browser_calls
+            browser_calls += 1
+            browser_entered.set()
+            release_browser.wait(timeout=5.0)
+            return ProbeResult(
+                ErrorCode.OK,
+                candidates=[MediaCandidate(url="https://cdn.example.com/shared.mp4", duration=30, height=720, via_browser=True)],
+                via_browser=True,
+            )
+
+        with (
+            patch.object(tgbot.telegram_io, "backoff_delay", return_value=0.0),
+            patch.object(Message, "reply_text", tracking_reply_text),
+            patch.object(tgbot.flows, "probe_ytdlp", fake_ytdlp),
+            patch.object(tgbot.flows, "probe_with_browser", fake_browser),
+            patch.object(downloaders.probe, "browser_available", return_value=True),
+            patch.object(tgbot.preview, "browser_available", return_value=True),
+        ):
+            url = "https://example.com/shared"
+            task_a = asyncio.create_task(tgbot.handlers.handle_text(Update(1, message=make_message(url, user_id=100)), ctx))
+            self.assertTrue(await asyncio.to_thread(ytdlp_entered.wait, 5.0))
+
+            task_b = asyncio.create_task(tgbot.handlers.handle_text(Update(2, message=make_message(url, user_id=200)), ctx))
+            while 200 not in statuses:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            release_ytdlp.set()
+            self.assertTrue(await asyncio.to_thread(browser_entered.wait, 5.0))
+            await asyncio.wait_for(waiter_200_browser.wait(), timeout=2.0)
+
+            task_c = asyncio.create_task(tgbot.handlers.handle_text(Update(3, message=make_message(url, user_id=300)), ctx))
+            await asyncio.wait_for(waiter_300_browser.wait(), timeout=2.0)
+
+            release_browser.set()
+            await asyncio.wait_for(asyncio.gather(task_a, task_b, task_c), timeout=5.0)
+
+        self.assertEqual(ytdlp_calls, 1)
+        self.assertEqual(browser_calls, 1)
+        self.assertGreaterEqual(owner_edit_attempts, 1)
+        self.assertIn(tgbot.texts.BROWSER_TEXT, [t for _, t, _ in statuses[200].edits])
+        self.assertIn(tgbot.texts.BROWSER_TEXT, [t for _, t, _ in statuses[300].edits])
+        self.assertEqual(len(state.pending), 3)
+        self.assertEqual({p.user_id for p in state.pending.values()}, {100, 200, 300})
+        self.assertEqual(state.in_flight_probes, {})
+        self.assertEqual(state.active_users, set())
+        self.assertEqual(state.semaphore._value, 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
