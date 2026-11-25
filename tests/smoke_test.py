@@ -1234,6 +1234,152 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.active_users, set())
         self.assertEqual(state.semaphore._value, 2)
 
+    async def test_audio_only_wording_and_video_regression(self) -> None:
+        audio_probe = ProbeResult(
+            ErrorCode.OK,
+            candidates=[MediaCandidate(url="https://soundcloud.com/a/track", title="Track", duration=90, audio_only=True)],
+        )
+        html_ao, markup_ao, _ = tgbot.preview.build_preview("SoundCloud", audio_probe, allow_browser=False)
+        self.assertIn(tgbot.texts.CONFIRM_AUDIO_QUESTION, html_ao)
+        self.assertEqual(markup_ao.inline_keyboard[0][0].text, "✅ Ya, unduh audio")
+        self.assertFalse(any(cb.startswith("au:") for cb in extract_callbacks(markup_ao)))
+        assert_valid_html(html_ao)
+
+        state = make_state(user_cooldown_seconds=0.0)
+        fake_bot = FakeBot()
+        ctx = make_context(state, fake_bot)
+        runner_audio_args: list[bool] = []
+        orig_make_runner = tgbot.handlers.make_runner
+
+        def spy_make_runner(*args: object, audio: bool = False, **kwargs: object) -> object:
+            runner_audio_args.append(audio)
+            return orig_make_runner(*args, audio=audio, **kwargs)  # type: ignore[arg-type]
+
+        def fake_generic(_url: str, job_id: str, _cancel: object) -> DownloadResult:
+            out = TEMP_DIR / f"{job_id}.mp3"
+            out.write_bytes(b"MP3DATA")
+            return DownloadResult(out, ErrorCode.OK, audio_only=True)
+
+        with (
+            patch.object(tgbot.flows, "probe_ytdlp", return_value=audio_probe),
+            patch.object(tgbot.handlers, "make_runner", side_effect=spy_make_runner),
+            patch.dict(tgbot.workers.DOWNLOADERS, {"generic": fake_generic}),
+        ):
+            await tgbot.handlers.handle_text(Update(1, message=make_message("https://soundcloud.com/a/track")), ctx)
+            tok = next(iter(state.pending))
+            preview_msg = self.sent[-1]
+            q_dl = FakeQuery(f"dl:{tok}:0")
+            await tgbot.handlers.handle_choice(SimpleNamespace(callback_query=q_dl, effective_user=User(100, "u", False)), ctx)
+
+        self.assertEqual(runner_audio_args, [False])
+        self.assertIn(tgbot.texts.CHOSEN_NOTE.format(label="audio ini"), preview_msg.text)
+        self.assertEqual(self.sent[-1].text, tgbot.texts.STATUS_AUDIO_TEXT.format(platform="Soundcloud"))
+        self.assertEqual(len(fake_bot.audios), 1)
+        self.assertEqual(fake_bot.videos, [])
+        self.assertEqual(state.jobs_ok, 1)
+
+        # Confirm off with audio_only candidate: status says audio, make_runner still uses audio=False.
+        state2 = make_state(confirm_before_download=False, user_cooldown_seconds=0.0)
+        fake_bot2 = FakeBot()
+        ctx2 = make_context(state2, fake_bot2)
+        flows_audio_args: list[bool] = []
+        orig_flows_make_runner = tgbot.flows.make_runner
+
+        def spy_flows_make_runner(*args: object, audio: bool = False, **kwargs: object) -> object:
+            flows_audio_args.append(audio)
+            return orig_flows_make_runner(*args, audio=audio, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch.object(tgbot.flows, "probe_ytdlp", return_value=audio_probe),
+            patch.object(tgbot.flows, "make_runner", side_effect=spy_flows_make_runner),
+            patch.dict(tgbot.workers.DOWNLOADERS, {"generic": fake_generic}),
+        ):
+            await tgbot.handlers.handle_text(Update(2, message=make_message("https://soundcloud.com/a/track")), ctx2)
+
+        self.assertEqual(flows_audio_args, [False])
+        self.assertTrue(any(t == tgbot.texts.STATUS_AUDIO_TEXT.format(platform="Soundcloud") for _, t, _ in self.sent[-1].edits))
+        self.assertEqual(len(fake_bot2.audios), 1)
+
+        # Regression: normal video candidate keeps video wording.
+        video_probe = ProbeResult(
+            ErrorCode.OK,
+            candidates=[MediaCandidate(url="https://youtube.com/watch?v=vid", title="Video", duration=30, height=720)],
+        )
+        html_v, markup_v, _ = tgbot.preview.build_preview("YouTube", video_probe, allow_browser=False)
+        self.assertIn(tgbot.texts.CONFIRM_QUESTION, html_v)
+        self.assertEqual(markup_v.inline_keyboard[0][0].text, "✅ Ya, unduh")
+
+    async def test_disk_space_guard_and_classification(self) -> None:
+        import errno
+        import requests
+        from downloaders import MIN_FREE_DISK_BYTES
+        from downloaders.tiktok import scrape_tiktok
+        from downloaders.ytdlp import classify_error
+
+        state = make_state()
+        fake_bot = FakeBot()
+        ctx = make_context(state, fake_bot)
+        called = False
+
+        def fail_if_called(_job_id: str, _cancel: object) -> DownloadResult:
+            nonlocal called
+            called = True
+            return DownloadResult(None, ErrorCode.UNKNOWN)
+
+        with patch.object(tgbot.flows, "free_disk_bytes", return_value=MIN_FREE_DISK_BYTES - 1):
+            await tgbot.flows.process_download(
+                ctx, make_message("https://youtube.com/watch?v=low"), 100, "youtube", "YouTube", fail_if_called, state
+            )
+        self.assertFalse(called)
+        self.assertEqual(self.sent[-1].text, tgbot.texts.ERROR_MESSAGES[ErrorCode.DISK_FULL])
+        self.assertEqual(state.jobs_failed, 1)
+        self.assertEqual(state.jobs_ok, 0)
+
+        def ok_runner(job_id: str, _cancel: object) -> DownloadResult:
+            out = TEMP_DIR / f"{job_id}.mp4"
+            out.write_bytes(b"MP4")
+            return DownloadResult(out, ErrorCode.OK)
+
+        state2 = make_state()
+        fake_bot2 = FakeBot()
+        ctx2 = make_context(state2, fake_bot2)
+        with patch.object(tgbot.flows, "free_disk_bytes", return_value=None):
+            await tgbot.flows.process_download(
+                ctx2, make_message("https://youtube.com/watch?v=unk"), 100, "youtube", "YouTube", ok_runner, state2
+            )
+        self.assertEqual(state2.jobs_ok, 1)
+        self.assertEqual(len(fake_bot2.videos), 1)
+
+        self.assertEqual(classify_error("ERROR: unable to write: [Errno 28] No space left on device"), ErrorCode.DISK_FULL)
+        self.assertEqual(classify_error("ffmpeg: No space left on device"), ErrorCode.DISK_FULL)
+        self.assertEqual(classify_error("disk full"), ErrorCode.DISK_FULL)
+
+        class FakeResp:
+            status_code = 200
+            headers = {"Content-Type": "video/mp4", "Content-Length": "10"}
+            def iter_content(self, chunk_size: int = 1024):
+                yield b"12345"
+            def close(self) -> None:
+                pass
+
+        with (
+            patch("downloaders.tiktok._resolve_short_link", return_value="https://www.tiktok.com/@a/video/1"),
+            patch("downloaders.tiktok._fetch_download_link", return_value="https://cdn.example.com/v.mp4"),
+            patch.object(requests.Session, "request", return_value=FakeResp()),
+            patch("builtins.open", side_effect=OSError(errno.ENOSPC, "No space left on device")),
+        ):
+            res = scrape_tiktok("https://www.tiktok.com/@a/video/1", "tiktok_disk_full")
+        self.assertEqual(res.error, ErrorCode.DISK_FULL)
+
+        low_info = {
+            "yt_dlp_version": "2026.10.26", "browser_available": False, "playwright_version": None,
+            "ffmpeg_available": True, "temp_files": 0, "temp_bytes": 0,
+            "disk_free_bytes": MIN_FREE_DISK_BYTES - 1,
+        }
+        self.assertIn("⚠️", tgbot.handlers.build_health_text(state, low_info))
+        ok_info = {**low_info, "disk_free_bytes": MIN_FREE_DISK_BYTES}
+        self.assertNotIn("⚠️", tgbot.handlers.build_health_text(state, ok_info))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
