@@ -41,7 +41,9 @@ description: "Probe/confirmation flow and Telegram API rules for bot.py and tgbo
 - **Preview** (`build_preview`):
   - yt-dlp results show title, site, uploader, duration, quality (shortest
     side, so portrait 720x1280 = 720p), and estimated size, with buttons
-    ✅ / 🔍 browser (generic only) / ❌.
+    ✅ / 🔍 browser (generic only) / ❌. `audio_only` candidates use
+    `CONFIRM_AUDIO_QUESTION` and audio wording on the confirm button, chosen
+    note, and status text without changing `make_runner(..., audio=...)`.
   - Browser results show a page screenshot plus up to 5 numbered candidates
     (⚠️ = likely ad), with buttons "Video N (m:ss)" / ❌.
   - Captions are capped at 1024 chars. If the text is longer, or Telegram
@@ -64,6 +66,10 @@ description: "Probe/confirmation flow and Telegram API rules for bot.py and tgbo
 - **Download runner:** `make_runner()` returns `DOWNLOADERS[platform]` for
   yt-dlp candidates, or `download_browser_stream(candidate, probe, ...)` for
   browser candidates.
+- **Disk guard:** `process_download()` checks `free_disk_bytes(TEMP_DIR)` via
+  `asyncio.to_thread` before starting a worker; if below `MIN_FREE_DISK_BYTES`
+  (`3 * MAX_FILE_SIZE_BYTES`), it aborts with `ErrorCode.DISK_FULL` (`None`
+  proceeds). `/health` shows `⚠️` next to free disk when below the minimum.
 
 ## Telegram rules (tgbot/)
 

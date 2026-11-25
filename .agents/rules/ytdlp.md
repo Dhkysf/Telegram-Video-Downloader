@@ -40,15 +40,17 @@ description: "yt-dlp options, format/size limits, remuxing, error mapping, and T
   2. 429/rate limit → RATE_LIMITED
   3. login/private/sign in/cookies → PRIVATE_OR_LOGIN
   4. unsupported url → UNSUPPORTED
-  5. ffmpeg → UNKNOWN
-  6. 404/unavailable/not found → NOT_FOUND
-  7. 5xx/timeouts → NETWORK
+  5. no space left / errno 28 / disk full → DISK_FULL
+  6. ffmpeg → UNKNOWN
+  7. 404/unavailable/not found → NOT_FOUND
+  8. 5xx/timeouts → NETWORK
 
   Live streams return `ErrorCode.LIVE`. Only RATE_LIMITED and 5xx are retried
   (exponential backoff with jitter, max 3 attempts), in both probe and
   download.
 - **TikTok fallback** (`tiktok.py`) runs only when yt-dlp fails, and not for
-  TOO_LARGE or TIMEOUT.
+  TOO_LARGE, TIMEOUT, or DISK_FULL. `OSError(ENOSPC)` on write maps to
+  `ErrorCode.DISK_FULL`.
   - Endpoints, form fields, and regexes are module constants.
   - An empty 200 body from ssstik is a soft rate limit, reported as
     RATE_LIMITED.

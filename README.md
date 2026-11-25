@@ -181,6 +181,7 @@ Never share `instagram_cookies.txt` or commit it to git.
 - **`Conflict` error in `bot.log`**: Another instance of `bot.py` is already polling with the same token. Stop the other instance (or run `.venv\Scripts\python.exe tray_app.pyw --stop`).
 - **FFmpeg / Edge / Playwright missing**: Install FFmpeg with `winget install Gyan.FFmpeg` (or set `FFMPEG_DIR`), ensure Microsoft Edge is installed, and verify `.venv\Scripts\python -m pip install -r requirements.txt`.
 - **Bot is silent**: Check `ALLOWED_USER_IDS` in `config.py` or your environment—if set, only listed user IDs receive replies.
+- **Low disk space (`Penyimpanan di PC bot hampir penuh`)**: Downloads abort when free disk space on `temp_downloads/` is below `150 MB` (`3 × 50 MB`). `/health` also shows `⚠️` next to free disk space. Free up disk space or clear stale files in `temp_downloads/` and try again.
 - **Update `yt-dlp` manually**: Run `.venv\Scripts\python -m pip install -U yt-dlp` (with the bot stopped).
 
 ## 11. Upgrading from the old `.bat`/`.vbs` setup
