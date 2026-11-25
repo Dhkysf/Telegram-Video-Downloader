@@ -16,19 +16,26 @@ description: "Probe/confirmation flow and Telegram API rules for bot.py and tgbo
      confirmation is off.
   5. Release the user in `finally`.
 - `probe_link`:
-  1. `probe_ytdlp`.
-  2. If `should_try_browser(platform, result)`, edit the status to
-     `BROWSER_TEXT` and run `probe_with_browser`. This applies only to
-     generic sites, only for UNSUPPORTED/NOT_FOUND/UNKNOWN, never for
-     blocked-address or DRM errors, and only if Playwright is installed.
+  1. Hold `state.semaphore` ONLY around `probe_ytdlp`.
+  2. If `should_try_browser(platform, result)`, release `state.semaphore`,
+     signal any single-flight `on_browser` event, edit the status to
+     `BROWSER_TEXT` (swallowing any `TelegramError` so one user's Telegram
+     failure cannot abort a shared probe), and run `probe_with_browser`
+     outside `state.semaphore` (it already has `_browser_slots`,
+     `MAX_BROWSERS=1`). `force_browser=True` also runs without
+     `state.semaphore`. This applies only to generic sites, only for
+     UNSUPPORTED/NOT_FOUND/UNKNOWN, never for blocked-address or DRM errors,
+     and only if Playwright is installed.
   3. If both fail, report the more informative error.
 - **Probe cache & single-flight:** `check_link` caches successful `ProbeResult`
   (`error == OK` and non-empty `candidates`) in `state.probe_cache` for
   `PROBE_CACHE_TTL_SECONDS=300` (max `PROBE_CACHE_MAX_ENTRIES=50`, oldest
   evicted). Key is `(normalized URL, platform, mode)` where `mode` is `"auto"`
   or `"browser"` (lowercase scheme+host, `#fragment` dropped, path/query kept).
-  Concurrent probes for the same key share an in-flight `asyncio.Future` in
-  `state.in_flight_probes` (single-flight). Errors are never cached.
+  Concurrent probes for the same key share `(asyncio.Future, asyncio.Event)`
+  in `state.in_flight_probes` (single-flight; no `await` between check and
+  set, cleaned up in `finally`). Setting the event wakes waiters so they also
+  edit their own status to `BROWSER_TEXT` (best-effort). Errors are never cached.
 - For TikTok, a failed yt-dlp probe still returns one candidate marked
   `info_unavailable`, because the scraper may download it anyway.
 - **Preview** (`build_preview`):
