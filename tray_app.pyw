@@ -234,6 +234,8 @@ class TrayApp:
             color: make_tray_icon(color)
             for color in set(STATUS_COLORS.values())
         }
+        self._desired_icon_key: BotStatus = BotStatus.STOPPED
+        self._shown_icon_key: Optional[BotStatus] = None
 
         self.root = tk.Tk()
         self.root.title("Telegram Video Bot")
@@ -374,6 +376,27 @@ class TrayApp:
             return False
         return self.controller.snapshot().status in (BotStatus.RUNNING, BotStatus.RESTARTING)
 
+    def _on_icon_ready(self, icon: "pystray.Icon") -> None:
+        if self._closing:
+            return
+        icon.visible = True
+        self._schedule_ui(self._sync_icon)
+
+    def _sync_icon(self) -> bool:
+        if self._selftest or self._closing or not self._icon.visible:
+            return False
+        if self._desired_icon_key == self._shown_icon_key:
+            return False
+        color = STATUS_COLORS[self._desired_icon_key]
+        self._icon.icon = self._icons[color]
+        self._icon.title = f"Telegram Video Bot - {self._desired_icon_key.value}"
+        self._shown_icon_key = self._desired_icon_key
+        try:
+            self._icon.update_menu()
+        except Exception:
+            pass
+        return True
+
     def _apply_snapshot(self, snap: ControllerSnapshot) -> None:
         color = STATUS_COLORS[snap.status]
         self._dot_canvas.itemconfig(self._dot_id, fill=color)
@@ -389,9 +412,9 @@ class TrayApp:
         self._stop_btn.configure(state="normal" if self._can_stop() else "disabled")
         self._restart_btn.configure(state="disabled" if self._action_busy else "normal")
 
-        if not self._selftest:
-            self._icon.icon = self._icons[color]
-            self._icon.title = f"Telegram Video Bot - {snap.status.value}"
+        self._desired_icon_key = snap.status
+        synced = self._sync_icon()
+        if not synced and not self._selftest and self._icon.visible:
             try:
                 self._icon.update_menu()
             except Exception:
@@ -403,6 +426,7 @@ class TrayApp:
         snap = self.controller.snapshot()
         if snap.status == BotStatus.RUNNING and snap.started_at is not None:
             self._uptime_var.set(format_uptime(time.monotonic() - snap.started_at))
+        self._sync_icon()
         self.root.after(1000, self._tick)
 
     def _run_action(self, fn: Callable[[], object]) -> None:
@@ -436,7 +460,7 @@ class TrayApp:
         self._auto_start = not self._auto_start
         self._settings["auto_start"] = self._auto_start
         save_tray_settings(self._settings)
-        if not self._selftest:
+        if not self._selftest and self._icon.visible:
             try:
                 self._icon.update_menu()
             except Exception:
@@ -519,7 +543,12 @@ class TrayApp:
         """Start the tray icon thread, optional auto-start, and Tk mainloop."""
         if self._start_hidden:
             self.root.withdraw()
-        threading.Thread(target=self._icon.run, name="pystray", daemon=True).start()
+        threading.Thread(
+            target=self._icon.run,
+            kwargs={"setup": self._on_icon_ready},
+            name="pystray",
+            daemon=True,
+        ).start()
         self.root.after(1000, self._tick)
         if self._force_start or self._auto_start:
             self._do_start()
