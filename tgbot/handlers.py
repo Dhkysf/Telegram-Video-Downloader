@@ -226,15 +226,17 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         await _answer(query, "")
         if candidate is not None and idx is not None:
-            label = f"video #{idx + 1}" if pending.probe.via_browser else "video ini"
-            if audio:
-                label = f"audio dari {label}"
+            audio_text = audio or candidate.audio_only
+            if pending.probe.via_browser:
+                label = f"audio dari video #{idx + 1}" if audio_text else f"video #{idx + 1}"
+            else:
+                label = "audio ini" if audio_text else "video ini"
             if not await finish_preview(pending, CHOSEN_NOTE.format(label=label)):
                 return
             runner = make_runner(pending.platform, pending.url, candidate, pending.probe, audio=audio)
             await process_download(
                 context, pending.message, user.id, pending.platform, pending.site, runner, state,
-                audio=audio,
+                audio=audio_text,
             )
         else:
             if not await finish_preview(pending, BROWSER_NOTE):

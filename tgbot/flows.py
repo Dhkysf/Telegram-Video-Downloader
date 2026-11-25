@@ -280,7 +280,9 @@ async def check_link(
                     await safe_edit(status, ONLY_ADS_TEXT)
                 return
             runner = make_runner(platform, url, candidate, probe)
-            await process_download(context, message, user_id, platform, site, runner, state, status)
+            await process_download(
+                context, message, user_id, platform, site, runner, state, status, audio=candidate.audio_only
+            )
             return
         pending = PendingChoice(user_id, message, url, platform, site, probe, time.monotonic())
         await send_preview(pending, state)

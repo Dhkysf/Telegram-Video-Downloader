@@ -14,7 +14,7 @@ from telegram.error import BadRequest, Forbidden, TelegramError
 from downloaders import MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB, MediaCandidate, ProbeResult, browser_available
 from tgbot.state import PENDING_MAX_ENTRIES, BotState, PendingChoice, purge_expired
 from tgbot.telegram_io import tg_call
-from tgbot.texts import AUDIO_BUTTON_TEXT, CHOOSE_QUESTION, CONFIRM_QUESTION
+from tgbot.texts import AUDIO_BUTTON_TEXT, CHOOSE_QUESTION, CONFIRM_AUDIO_QUESTION, CONFIRM_QUESTION
 
 logger = logging.getLogger("video_bot.preview")
 
@@ -77,7 +77,8 @@ def build_preview(site: str, probe: ProbeResult, allow_browser: bool) -> tuple[s
         lines.append("Video yang ketemu:")
         for index, candidate in enumerate(probe.candidates, start=1):
             lines.append(candidate_line(index, candidate))
-            label = f"{'⚠️ ' if candidate.likely_ad else ''}Video {index} ({format_duration(candidate.duration)})"
+            kind_label = "Audio" if candidate.audio_only else "Video"
+            label = f"{'⚠️ ' if candidate.likely_ad else ''}{kind_label} {index} ({format_duration(candidate.duration)})"
             row = [InlineKeyboardButton(label, callback_data=f"dl:TOKEN:{index - 1}")]
             if not candidate.audio_only:
                 row.append(InlineKeyboardButton(f"🎵 Audio {index}", callback_data=f"au:TOKEN:{index - 1}"))
@@ -117,8 +118,9 @@ def build_preview(site: str, probe: ProbeResult, allow_browser: bool) -> tuple[s
                     "kecil, tapi bisa saja tetap kebesaran."
                 )
         lines.append("")
-        lines.append(CONFIRM_QUESTION)
-        rows.append([InlineKeyboardButton("✅ Ya, unduh", callback_data="dl:TOKEN:0")])
+        lines.append(CONFIRM_AUDIO_QUESTION if candidate.audio_only else CONFIRM_QUESTION)
+        confirm_label = "✅ Ya, unduh audio" if candidate.audio_only else "✅ Ya, unduh"
+        rows.append([InlineKeyboardButton(confirm_label, callback_data="dl:TOKEN:0")])
         # Audio-only sources need no extra button; TikTok without info would rely
         # on the video-only scraper, so audio is not offered there either.
         if not candidate.audio_only and not candidate.info_unavailable:

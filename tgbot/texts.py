@@ -34,6 +34,7 @@ BROWSER_TEXT = (
 )
 BROWSER_FORCED_TEXT = "🌐 Oke, aku buka halamannya pakai browser. Tunggu sebentar ya (bisa sampai 1 menit)..."
 CONFIRM_QUESTION = "Betul ini video yang mau kamu unduh?"
+CONFIRM_AUDIO_QUESTION = "Betul ini audio yang mau kamu unduh?"
 CHOOSE_QUESTION = "Pilih video yang mau diunduh:"
 ONLY_ADS_TEXT = (
     "⚠️ Aku cuma menemukan video yang kelihatannya iklan, jadi tidak aku unduh. "
